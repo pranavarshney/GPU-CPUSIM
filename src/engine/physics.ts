@@ -21,21 +21,25 @@
  *    Note: SRAM scales slower than logic below 5nm (embedded in node.sramDensityMTrPerMm2).
  *
  * 3. VOLTAGE-FREQUENCY WALL & POWER (GHz, V, W):
- *    V_min(f) = V_nom * (0.72 + 0.28 * (f / (f_ref * archClockEff * transClockMult))^1.85)
- *    P_dyn    = alpha * C_eff * V^2 * f_eff
+ *    Unified across CPU & GPU:
+ *    V_min(f) = V_nom * (0.72 + 0.28 * (f / f_ref_eff)^1.85)
+ *      where CPU f_ref_eff = f_ref * archClockEff * transClockMult
+ *      and   GPU f_ref_eff = f_ref * 0.72 * archClockEff * transClockMult
+ *    P_dyn    = alpha * C_eff * V^2 * f_eff  (scales with clock ratio as P_dyn ∝ f^2.2)
  *    P_leak   = k_leak * eta_leak * N_tr * V * exp((T_j - 25) / 42)
  *    P_tunnel = tunnelFloor * (1 - trans.tunnelingMitigation) * N_tr
  *    P_raw    = P_dyn + P_leak + P_tunnel
- *    If P_raw > powerLimitW, f_eff rolls back via cubic power-frequency conservation.
+ *    If P_dyn + P_leak + P_tunnel > powerLimitW inside the thermal loop, f_eff rolls back via P_dyn ∝ f^2.2.
  *
- * 4. THERMAL EQUILIBRIUM & CONTINUOUS THROTTLING (deg C, W/mm^2):
- *    Solved via 5-step fixed-point iteration coupling T_j <-> P_leak(T_j):
+ * 4. THERMAL EQUILIBRIUM & ITERATIVE THROTTLING (deg C, W/mm^2):
+ *    Solved via 5-step fixed-point iteration coupling T_j <-> P_leak(T_j) <-> powerLimitW:
  *    heatFlux q = P_eff / max(A, 1)  [W/mm^2]
  *    R_hotspot  = 0.12 * q^0.6 * frontierFluxPenalty  [C/W]
- *    T_j = T_amb + P_eff * (max(0.03, (R_cool - R_pkgOffset) * frontierThermal) + R_hotspot)
+ *    T_j = T_amb + P_eff * (max(0.032, (R_cool - R_pkgOffset) * frontierThermal) + R_hotspot)
  *    If T_j > T_throttle:
- *       thermalRatio = max(0.22, 1 - 0.022 * (T_j - T_throttle))
- *       f_sustained  = f_eff * thermalRatio
+ *       Iteratively solves thermalRatio (up to 6 passes, floor 0.22) scaling P_dyn ∝ ratio^2.2
+ *       and recomputing P_leak(T_j), q, and T_j until T_j <= T_throttle or the 0.22 floor is hit.
+ *       f_sustained = f_target * powerRatio * thermalRatio
  *    Cryogenic cooling adds Carnot refrigeration draw: P_carnot = P_eff * carnotOverheadFactor.
  *
  * 5. MURPHY / SQUARED-POISSON WAFER YIELD (defects/cm^2, %):
@@ -49,8 +53,11 @@
  *    - CPU Multi-Core uses Amdahl + Interconnect contention:
  *      Scale(C) = C / (1 + 0.025*(C-1) + beta_interconnect * C^1.35 / pkg.interconnectBonus)
  *      Combined smoothly with RAM Bandwidth ceiling (GB/s) via harmonic roofline.
+ *      PCIe aggregate bandwidth (lanes * perLaneGBs(maxPcieGen)) feeds General Compute & Gaming
+ *      with logarithmic diminishing returns and flags I/O bottlenecks when undersized.
  *    - GPU Rendering combines Shader FLOPS, Pixel/Texel Fill-Rate (ROPs/TMUs), and
- *      VRAM Bandwidth (BusWidth/8 * DataRate * Compression). VRAM capacity does NOT boost
+ *      VRAM Bandwidth (BusWidth/8 * DataRate * Compression) aided by L1 + L2 cache relief
+ *      (1 + 0.14*ln(1 + L2_MB/2) + 0.04*ln(1 + L1_MB/0.016)). VRAM capacity does NOT boost
  *      speed linearly; it governs a Workload Footprint Cap penalty only when undersized.
  *
  * LIMITATIONS:
@@ -64,9 +71,11 @@ import {
   getCoolingSpec,
   getCpuArch,
   getGpuArch,
+  getMaxPcieGen,
   getMaxWaferDiameterMm,
   getMemoryTech,
   getPackagingSpec,
+  getPcieBandwidthPerLaneGBs,
   getProcessNode,
   getTransistorStructure,
   ISA_EXTENSIONS,
@@ -81,6 +90,48 @@ import type {
   DieBlockRect,
   GpuBlueprint,
 } from './types';
+
+// ─── DOCUMENTED PHYSICS & UI TUNING CONSTANTS ───────────────────────────────
+/** Power-frequency scaling exponent for dynamic power rollback (P_dyn ∝ f^2.2). */
+export const POWER_FREQ_EXPONENT = 2.2;
+/** GPU effective reference clock multiplier relative to process node refClockGHz. */
+export const GPU_REF_CLOCK_FACTOR = 0.72;
+/** Unified voltage-frequency wall baseline fraction at low clocks (V_min = V_nom * (base + slope * ratio^exp)). */
+export const V_MIN_BASE = 0.72;
+/** Unified voltage-frequency wall slope coefficient across CPU and GPU. */
+export const V_MIN_SLOPE = 0.28;
+/** Voltage-frequency wall non-linearity exponent. */
+export const V_MIN_EXPONENT = 1.85;
+/** Max slider clock ratio above effective reference clock so V_min(R) <= 1.45 * V_nom (0.72 + 0.28*1.55^1.85 ≈ 1.35). */
+export const MAX_CLOCK_RATIO_CAP = 1.55;
+/** Voltage slider step (V); 0.01 V keeps every nominalVoltageV on an exact slider step. */
+export const VOLTAGE_SLIDER_STEP = 0.01;
+/** Minimum core voltage slider bound (V). */
+export const VOLTAGE_SLIDER_MIN = 0.25;
+/** Baseline maximum voltage multiplier over process node nominal voltage. */
+export const VOLTAGE_MAX_MULTIPLIER = 1.45;
+/** Efficiency-core dynamic power multiplier relative to P-core architecture powerMultiplier. */
+export const E_CORE_POWER_FACTOR = 0.85;
+/** Efficiency-core voltage rail ratio relative to primary Vcore. */
+export const E_CORE_VOLTAGE_SCALE = 0.9;
+/** Minimum dynamic power fraction preserved during power-limit frequency rollback. */
+export const POWER_DYN_FLOOR = 0.08;
+/** Minimum clock ratio floor under power-limit throttling. */
+export const POWER_RATIO_FLOOR = 0.28;
+/** Minimum clock ratio floor under iterative thermal throttling. */
+export const THERMAL_RATIO_FLOOR = 0.22;
+/** Fixed-point iterations coupling Tj, leakage, and power-limit rollback. */
+export const THERMAL_SOLVER_ITERATIONS = 5;
+/** Maximum iterations for iterative thermal throttling convergence. */
+export const THERMAL_THROTTLE_MAX_ITERATIONS = 6;
+/** Valid GPU memory bus widths (bits). */
+export const GPU_BUS_WIDTHS = [64, 128, 192, 256, 384, 512, 1024, 2048, 4096] as const;
+
+export interface SliderRange {
+  min: number;
+  max: number;
+  step: number;
+}
 
 export interface PhysicsContext {
   unlockedTechIds: string[];
@@ -107,15 +158,15 @@ export const PHYSICS_DOCUMENTATION: PhysicsDocEntry[] = [
   },
   {
     title: 'Voltage-Frequency Wall & Dynamic Power',
-    equation: 'V_min(f) = V_nom · (0.72 + 0.28 · (f / f_ref)^1.85)  |  P_dyn = α · C_eff · V² · f_eff',
+    equation: 'V_min(f) = V_nom · (0.72 + 0.28 · (f / f_ref_eff)^1.85)  |  P_dyn = α · C_eff · V² · f_eff  (P_dyn ∝ f^2.2)',
     units: 'V, GHz, W',
-    assumptions: 'Operating below V_min triggers voltage instability. Exceeding power limit invokes cubic frequency rollback.',
+    assumptions: 'Unified V_min curve for CPU and GPU (GPU f_ref_eff includes 0.72× factor). Exceeding power limit invokes P_dyn ∝ f^2.2 rollback.',
   },
   {
-    title: 'Leakage, Quantum Tunneling & Thermal Loop',
+    title: 'Leakage, Quantum Tunneling & Iterative Thermal Loop',
     equation: 'P_leak = k_leak · N_tr · V · exp((T_j − 25)/42) + P_tunnel  |  T_j = T_amb + P_eff · (R_θ + 0.12 · q^0.6)',
     units: 'W, °C, W/mm², °C/W',
-    assumptions: '5-iteration fixed-point solver couples T_j and P_leak. T_j > T_throttle reduces sustained clock continuously.',
+    assumptions: '5-step fixed-point solver couples T_j, P_leak, and power-limit rollback; up to 6-pass thermal loop settles T_j ≤ T_throttle (0.22× floor).',
   },
   {
     title: 'Murphy Wafer Yield & Process Maturation',
@@ -124,10 +175,10 @@ export const PHYSICS_DOCUMENTATION: PhysicsDocEntry[] = [
     assumptions: 'Squared-Poisson Murphy model with 3 mm wafer edge exclusion and 0.2 mm scribe lanes.',
   },
   {
-    title: 'Roofline Bandwidth & Multicore Scaling',
-    equation: 'Scale(C) = C / (1 + 0.025(C−1) + β · C^1.35 / η_pkg)  |  BW_VRAM = (Bus/8) · MT/s · η_comp',
+    title: 'Roofline Bandwidth, Caches & PCIe I/O',
+    equation: 'Scale(C) = C / (1 + 0.025(C−1) + β · C^1.35 / η_pkg)  |  BW_VRAM = (Bus/8) · MT/s · η_comp · (1 + 0.14·ln(1+L2/2) + 0.04·ln(1+L1/0.016))',
     units: 'GB/s, GFLOPS',
-    assumptions: 'VRAM capacity does not linearly boost FPS; it enforces workload footprint sufficiency. Oversized caches follow logarithmic diminishing returns.',
+    assumptions: 'CPU PCIe bandwidth (lanes × gen GB/s) feeds General Compute & Gaming with diminishing returns. GPU VRAM capacity enforces footprint sufficiency.',
   },
   {
     title: 'Constrained Frontier Synthesis',
@@ -136,6 +187,337 @@ export const PHYSICS_DOCUMENTATION: PhysicsDocEntry[] = [
     assumptions: 'Exponential RP escalation, logarithmic diminishing returns, plus physical trade-offs (Carnot overhead, flux sensitivity, metrology power).',
   },
 ];
+
+// ─── SHARED CLOCK / VOLTAGE / SLIDER BOUNDS & CLAMPING HELPERS ──────────────
+
+function roundToPrecision(val: number, step: number): number {
+  const decimals = step < 0.01 ? 3 : step < 0.1 ? 2 : step < 1 ? 3 : 0;
+  return Number(val.toFixed(decimals));
+}
+
+export function clampToSlider(value: number, range: SliderRange): number {
+  const clamped = Math.max(range.min, Math.min(range.max, value));
+  const steps = Math.round((clamped - range.min) / range.step);
+  const snapped = Math.max(range.min, Math.min(range.max, range.min + steps * range.step));
+  return roundToPrecision(snapped, range.step);
+}
+
+export function getEffectiveRefClockGHz(
+  kind: 'cpu' | 'gpu',
+  nodeId: string,
+  archId: string,
+  transId: string
+): number {
+  const node = getProcessNode(nodeId);
+  const trans = getTransistorStructure(transId);
+  if (kind === 'cpu') {
+    const arch = getCpuArch(archId);
+    return node.refClockGHz * arch.clockEfficiency * trans.clockMultiplier;
+  }
+  const arch = getGpuArch(archId);
+  return node.refClockGHz * GPU_REF_CLOCK_FACTOR * arch.clockEfficiency * trans.clockMultiplier;
+}
+
+export function getClockStepForMax(maxClockGHz: number): number {
+  return maxClockGHz < 0.2 ? 0.002 : maxClockGHz < 2 ? 0.02 : 0.05;
+}
+
+export function computeMinStableVoltageV(
+  kind: 'cpu' | 'gpu',
+  nodeId: string,
+  archId: string,
+  transId: string,
+  clockGHz: number
+): number {
+  const node = getProcessNode(nodeId);
+  const effectiveRefClockGHz = getEffectiveRefClockGHz(kind, nodeId, archId, transId);
+  const clockRatio = clockGHz / Math.max(0.005, effectiveRefClockGHz);
+  return Number(
+    (
+      node.nominalVoltageV *
+      (V_MIN_BASE + V_MIN_SLOPE * Math.pow(Math.max(0.1, clockRatio), V_MIN_EXPONENT))
+    ).toFixed(3)
+  );
+}
+
+/**
+ * Returns the maximum target clock slider ceiling (GHz) aligned to clockStep,
+ * using the exact same effective reference clock as the evaluator so V_min(maxClock)
+ * always stays within the voltage slider range.
+ */
+export function getMaxClockForArch(
+  kind: 'cpu' | 'gpu',
+  nodeId: string,
+  archId: string,
+  transId: string
+): number {
+  const effRef = getEffectiveRefClockGHz(kind, nodeId, archId, transId);
+  const rawMax = effRef * MAX_CLOCK_RATIO_CAP;
+  const step = getClockStepForMax(rawMax);
+  const snapped = Math.floor((rawMax + 1e-9) / step) * step;
+  return Math.max(step, roundToPrecision(snapped, step));
+}
+
+export function getMinClockForArch(
+  kind: 'cpu' | 'gpu',
+  nodeId: string,
+  archId: string,
+  transId: string
+): number {
+  const maxClock = getMaxClockForArch(kind, nodeId, archId, transId);
+  const step = getClockStepForMax(maxClock);
+  const effRef = getEffectiveRefClockGHz(kind, nodeId, archId, transId);
+  const rawMin = Math.max(0.004, effRef * (kind === 'cpu' ? 0.35 : 0.25));
+  const snapped = Math.round(rawMin / step) * step;
+  return Math.min(maxClock, Math.max(step, roundToPrecision(snapped, step)));
+}
+
+export function getMaxVoltageForConfig(
+  kind: 'cpu' | 'gpu',
+  nodeId: string,
+  archId: string,
+  transId: string
+): number {
+  const node = getProcessNode(nodeId);
+  const maxClock = getMaxClockForArch(kind, nodeId, archId, transId);
+  const vMinAtMax = computeMinStableVoltageV(kind, nodeId, archId, transId, maxClock);
+  const baseMax = Math.max(1.8, node.nominalVoltageV * VOLTAGE_MAX_MULTIPLIER);
+  const required = Math.max(baseMax, vMinAtMax + VOLTAGE_SLIDER_STEP);
+  const steps = Math.ceil((required - VOLTAGE_SLIDER_MIN - 1e-9) / VOLTAGE_SLIDER_STEP);
+  return Number((VOLTAGE_SLIDER_MIN + Math.max(1, steps) * VOLTAGE_SLIDER_STEP).toFixed(2));
+}
+
+export function getMaxBusWidthForVram(vramTechId: string): number {
+  return vramTechId === 'vram_hbm' || vramTechId === 'vram_photonic' ? 4096 : 512;
+}
+
+export function getCpuSliderBounds(
+  draft: Pick<CpuBlueprint, 'processNodeId' | 'architectureId' | 'transistorStructureId' | 'pClockGHz'>
+): {
+  pCores: SliderRange;
+  eCores: SliderRange;
+  pClockGHz: SliderRange;
+  eClockGHz: SliderRange;
+  voltageV: SliderRange;
+  ipcTuning: SliderRange;
+  l1CacheKBPerCore: SliderRange;
+  l2CacheMBTotal: SliderRange;
+  l3CacheMBTotal: SliderRange;
+  memoryChannels: SliderRange;
+  pcieLanes: SliderRange;
+  powerLimitW: SliderRange;
+  igpuTier: SliderRange;
+  npuTier: SliderRange;
+} {
+  const node = getProcessNode(draft.processNodeId);
+  const arch = getCpuArch(draft.architectureId);
+  const pClockMax = getMaxClockForArch('cpu', draft.processNodeId, draft.architectureId, draft.transistorStructureId);
+  const clockStep = getClockStepForMax(pClockMax);
+  const pClockMin = getMinClockForArch('cpu', draft.processNodeId, draft.architectureId, draft.transistorStructureId);
+
+  const effRef = getEffectiveRefClockGHz('cpu', draft.processNodeId, draft.architectureId, draft.transistorStructureId);
+  const rawEMin = Math.max(0.004, effRef * 0.25);
+  const eClockMin = Math.min(
+    pClockMax,
+    Math.max(clockStep, roundToPrecision(Math.round(rawEMin / clockStep) * clockStep, clockStep))
+  );
+  const clampedPClock = clampToSlider(draft.pClockGHz, { min: pClockMin, max: pClockMax, step: clockStep });
+  const eClockMax = Math.max(eClockMin, clampedPClock);
+
+  const l2Range: SliderRange =
+    node.featureSizeNm > 1000
+      ? { min: 0, max: 0.256, step: 0.004 }
+      : node.featureSizeNm > 50
+        ? { min: 0, max: 16, step: 0.5 }
+        : { min: 0, max: 128, step: 0.5 };
+
+  const l3Range: SliderRange =
+    node.featureSizeNm > 1000
+      ? { min: 0, max: 1, step: 0.25 }
+      : node.featureSizeNm > 50
+        ? { min: 0, max: 32, step: 2 }
+        : { min: 0, max: 512, step: 2 };
+
+  return {
+    pCores: { min: 1, max: arch.maxPCores, step: 1 },
+    eCores: { min: 0, max: arch.supportsECores ? arch.maxECores : 0, step: 1 },
+    pClockGHz: { min: pClockMin, max: pClockMax, step: clockStep },
+    eClockGHz: { min: eClockMin, max: eClockMax, step: clockStep },
+    voltageV: {
+      min: VOLTAGE_SLIDER_MIN,
+      max: getMaxVoltageForConfig('cpu', draft.processNodeId, draft.architectureId, draft.transistorStructureId),
+      step: VOLTAGE_SLIDER_STEP,
+    },
+    ipcTuning: { min: 0.85, max: arch.maxIpcTuning, step: 0.05 },
+    l1CacheKBPerCore: { min: 2, max: 256, step: 2 },
+    l2CacheMBTotal: l2Range,
+    l3CacheMBTotal: l3Range,
+    memoryChannels: { min: 1, max: 16, step: 1 },
+    pcieLanes: { min: 4, max: 128, step: 4 },
+    powerLimitW: { min: 5, max: 1200, step: 5 },
+    igpuTier: { min: 0, max: 5, step: 1 },
+    npuTier: { min: 0, max: 5, step: 1 },
+  };
+}
+
+export function getGpuSliderBounds(
+  draft: Pick<GpuBlueprint, 'processNodeId' | 'architectureId' | 'transistorStructureId' | 'vramTechId'>
+): {
+  shaderCores: SliderRange;
+  clockGHz: SliderRange;
+  rops: SliderRange;
+  tmus: SliderRange;
+  voltageV: SliderRange;
+  vramCapacityGB: SliderRange;
+  l1CacheMB: SliderRange;
+  l2CacheMB: SliderRange;
+  powerLimitW: SliderRange;
+  maxBusWidthBits: number;
+} {
+  const node = getProcessNode(draft.processNodeId);
+  const arch = getGpuArch(draft.architectureId);
+  const clockMax = getMaxClockForArch('gpu', draft.processNodeId, draft.architectureId, draft.transistorStructureId);
+  const clockStep = getClockStepForMax(clockMax);
+  const clockMin = getMinClockForArch('gpu', draft.processNodeId, draft.architectureId, draft.transistorStructureId);
+
+  const shaderStep = arch.maxShaderCores > 2000 ? 64 : arch.maxShaderCores > 256 ? 8 : 2;
+  const maxRops = Math.max(16, Math.min(512, Math.floor(arch.maxShaderCores / 16 / 2) * 2));
+  const maxTmus = Math.max(32, Math.min(1024, Math.floor(arch.maxShaderCores / 8 / 2) * 2));
+
+  const vramCapacityGB: SliderRange =
+    draft.vramTechId === 'vram_sdr'
+      ? { min: 0.125, max: 2, step: 0.125 }
+      : draft.vramTechId === 'vram_gddr5'
+        ? { min: 2, max: 16, step: 2 }
+        : { min: 2, max: 256, step: 2 };
+
+  const l1CacheMB: SliderRange =
+    node.featureSizeNm > 500
+      ? { min: 0.004, max: 0.5, step: 0.004 }
+      : { min: 0.5, max: 32, step: 0.5 };
+
+  const l2CacheMB: SliderRange =
+    node.featureSizeNm > 500
+      ? { min: 0.008, max: 2, step: 0.008 }
+      : { min: 2, max: 192, step: 2 };
+
+  return {
+    shaderCores: { min: shaderStep, max: arch.maxShaderCores, step: shaderStep },
+    clockGHz: { min: clockMin, max: clockMax, step: clockStep },
+    rops: { min: 2, max: maxRops, step: 2 },
+    tmus: { min: 2, max: maxTmus, step: 2 },
+    voltageV: {
+      min: VOLTAGE_SLIDER_MIN,
+      max: getMaxVoltageForConfig('gpu', draft.processNodeId, draft.architectureId, draft.transistorStructureId),
+      step: VOLTAGE_SLIDER_STEP,
+    },
+    vramCapacityGB,
+    l1CacheMB,
+    l2CacheMB,
+    powerLimitW: { min: 10, max: 1400, step: 10 },
+    maxBusWidthBits: getMaxBusWidthForVram(draft.vramTechId),
+  };
+}
+
+export function applyCpuNodeChange(draft: CpuBlueprint, nodeId: string): CpuBlueprint {
+  const node = getProcessNode(nodeId);
+  const effRef = getEffectiveRefClockGHz('cpu', nodeId, draft.architectureId, draft.transistorStructureId);
+  const nextDraftBase = { ...draft, processNodeId: nodeId };
+  const bounds = getCpuSliderBounds(nextDraftBase);
+  const pClockGHz = clampToSlider(effRef, bounds.pClockGHz);
+  const boundsWithP = getCpuSliderBounds({ ...nextDraftBase, pClockGHz });
+  const eClockGHz = clampToSlider(effRef * 0.72, boundsWithP.eClockGHz);
+  const voltageV = clampToSlider(node.nominalVoltageV, boundsWithP.voltageV);
+  return {
+    ...nextDraftBase,
+    pClockGHz,
+    eClockGHz,
+    voltageV,
+    l2CacheMBTotal: clampToSlider(draft.l2CacheMBTotal, boundsWithP.l2CacheMBTotal),
+    l3CacheMBTotal: clampToSlider(draft.l3CacheMBTotal, boundsWithP.l3CacheMBTotal),
+  };
+}
+
+export function applyCpuArchChange(draft: CpuBlueprint, archId: string): CpuBlueprint {
+  const arch = getCpuArch(archId);
+  const nextDraftBase = { ...draft, architectureId: archId };
+  const bounds = getCpuSliderBounds(nextDraftBase);
+  const pClockGHz = clampToSlider(draft.pClockGHz, bounds.pClockGHz);
+  const boundsWithP = getCpuSliderBounds({ ...nextDraftBase, pClockGHz });
+  return {
+    ...nextDraftBase,
+    pCores: clampToSlider(draft.pCores, boundsWithP.pCores),
+    eCores: arch.supportsECores ? clampToSlider(draft.eCores, boundsWithP.eCores) : 0,
+    ipcTuning: clampToSlider(draft.ipcTuning, boundsWithP.ipcTuning),
+    pClockGHz,
+    eClockGHz: clampToSlider(draft.eClockGHz, boundsWithP.eClockGHz),
+    voltageV: clampToSlider(draft.voltageV, boundsWithP.voltageV),
+  };
+}
+
+export function applyCpuTransistorChange(draft: CpuBlueprint, transId: string): CpuBlueprint {
+  const nextDraftBase = { ...draft, transistorStructureId: transId };
+  const bounds = getCpuSliderBounds(nextDraftBase);
+  const pClockGHz = clampToSlider(draft.pClockGHz, bounds.pClockGHz);
+  const boundsWithP = getCpuSliderBounds({ ...nextDraftBase, pClockGHz });
+  return {
+    ...nextDraftBase,
+    pClockGHz,
+    eClockGHz: clampToSlider(draft.eClockGHz, boundsWithP.eClockGHz),
+    voltageV: clampToSlider(draft.voltageV, boundsWithP.voltageV),
+  };
+}
+
+export function applyGpuNodeChange(draft: GpuBlueprint, nodeId: string): GpuBlueprint {
+  const node = getProcessNode(nodeId);
+  const effRef = getEffectiveRefClockGHz('gpu', nodeId, draft.architectureId, draft.transistorStructureId);
+  const nextDraftBase = { ...draft, processNodeId: nodeId };
+  const bounds = getGpuSliderBounds(nextDraftBase);
+  return {
+    ...nextDraftBase,
+    clockGHz: clampToSlider(effRef, bounds.clockGHz),
+    voltageV: clampToSlider(node.nominalVoltageV, bounds.voltageV),
+    l1CacheMB: clampToSlider(draft.l1CacheMB, bounds.l1CacheMB),
+    l2CacheMB: clampToSlider(draft.l2CacheMB, bounds.l2CacheMB),
+  };
+}
+
+export function applyGpuArchChange(draft: GpuBlueprint, archId: string): GpuBlueprint {
+  const nextDraftBase = { ...draft, architectureId: archId };
+  const bounds = getGpuSliderBounds(nextDraftBase);
+  return {
+    ...nextDraftBase,
+    shaderCores: clampToSlider(draft.shaderCores, bounds.shaderCores),
+    rops: clampToSlider(draft.rops, bounds.rops),
+    tmus: clampToSlider(draft.tmus, bounds.tmus),
+    clockGHz: clampToSlider(draft.clockGHz, bounds.clockGHz),
+    voltageV: clampToSlider(draft.voltageV, bounds.voltageV),
+  };
+}
+
+export function applyGpuTransistorChange(draft: GpuBlueprint, transId: string): GpuBlueprint {
+  const nextDraftBase = { ...draft, transistorStructureId: transId };
+  const bounds = getGpuSliderBounds(nextDraftBase);
+  return {
+    ...nextDraftBase,
+    clockGHz: clampToSlider(draft.clockGHz, bounds.clockGHz),
+    voltageV: clampToSlider(draft.voltageV, bounds.voltageV),
+  };
+}
+
+export function applyGpuVramChange(draft: GpuBlueprint, vramTechId: string): GpuBlueprint {
+  const nextDraftBase = { ...draft, vramTechId };
+  const bounds = getGpuSliderBounds(nextDraftBase);
+  const allowedBuses = GPU_BUS_WIDTHS.filter((b) => b <= bounds.maxBusWidthBits);
+  const clampedBus = allowedBuses.includes(draft.memoryBusWidthBits as (typeof GPU_BUS_WIDTHS)[number])
+    ? draft.memoryBusWidthBits
+    : allowedBuses[allowedBuses.length - 1] ?? 64;
+  return {
+    ...nextDraftBase,
+    memoryBusWidthBits: clampedBus,
+    vramCapacityGB: clampToSlider(draft.vramCapacityGB, bounds.vramCapacityGB),
+  };
+}
 
 function computeFrontierModifiers(frontierLevels: Record<string, number>) {
   const lDens = frontierLevels['ft_density'] ?? 0;
@@ -176,7 +558,7 @@ function computeMurphyYield(
   return Math.max(1.5, Math.min(99.2, murphy * 100 * qaFactor));
 }
 
-function solveThermalAndPower(params: {
+export function solveThermalAndPower(params: {
   dynamicPowerAtTargetW: number;
   baseLeakageAt25CW: number;
   tunnelingPowerW: number;
@@ -197,6 +579,7 @@ function solveThermalAndPower(params: {
   junctionTempC: number;
   throttleTempC: number;
   thermalThrottledRatio: number;
+  thermalFloorHit: boolean;
   carnotOverheadW: number;
 } {
   const cooling = getCoolingSpec(params.coolingId);
@@ -214,58 +597,98 @@ function solveThermalAndPower(params: {
       ? Math.min(cooling.throttleTempC, 78)
       : cooling.throttleTempC;
 
-  // Step 1: Evaluate raw power at nominal temperature estimate to compute power limit rollback
-  let tjEstimate = Math.max(cooling.ambientTempC + 10, 45);
-  let leakEstimate = params.baseLeakageAt25CW * Math.exp((tjEstimate - 25) / 42);
-  let rawPowerW = params.dynamicPowerAtTargetW + leakEstimate + params.tunnelingPowerW;
+  const evalHotspotR = (flux: number) =>
+    0.12 * Math.pow(Math.max(0.01, flux), 0.6) * params.frontierFluxPenalty;
 
-  // Power limit clamping (cubic frequency-power rollback approximation)
-  let powerThrottledRatio = 1.0;
-  if (rawPowerW > params.powerLimitW && params.dynamicPowerAtTargetW > 0.01) {
-    const allowedDyn = Math.max(
-      0.08 * params.dynamicPowerAtTargetW,
-      params.powerLimitW - leakEstimate - params.tunnelingPowerW
-    );
-    powerThrottledRatio = Math.max(
-      0.28,
-      Math.min(1.0, Math.pow(allowedDyn / params.dynamicPowerAtTargetW, 1 / 2.2))
-    );
-  }
-
-  let dynPowerW = params.dynamicPowerAtTargetW * Math.pow(powerThrottledRatio, 2.2);
-
-  // Step 2: 5-iteration fixed-point thermal <-> leakage solver
+  // Step 1: 5-iteration fixed-point solver coupling Tj <-> P_leak(Tj) <-> powerLimitW (P_dyn ∝ f^2.2)
   let junctionTempC = cooling.ambientTempC + 20;
   let leakagePowerW = params.baseLeakageAt25CW;
+  let powerThrottledRatio = 1.0;
+  let dynPowerW = params.dynamicPowerAtTargetW;
   let effectivePowerW = dynPowerW + leakagePowerW + params.tunnelingPowerW;
   let heatFluxWPerMm2 = effectivePowerW / Math.max(params.dieAreaMm2, 1);
 
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < THERMAL_SOLVER_ITERATIONS; i++) {
     const tempArg = Math.max(-140, Math.min(180, junctionTempC));
     leakagePowerW = params.baseLeakageAt25CW * Math.exp((tempArg - 25) / 42);
-    effectivePowerW = Math.min(
-      params.powerLimitW * 1.15,
-      dynPowerW + leakagePowerW + params.tunnelingPowerW
-    );
-    heatFluxWPerMm2 = effectivePowerW / Math.max(params.dieAreaMm2, 1);
-    const rHotspot = 0.12 * Math.pow(Math.max(0.01, heatFluxWPerMm2), 0.6) * params.frontierFluxPenalty;
-    junctionTempC = cooling.ambientTempC + effectivePowerW * (baseR + rHotspot);
-  }
 
-  // Step 3: Continuous thermal throttling when Tj > throttleTempC
-  let thermalThrottledRatio = 1.0;
-  if (junctionTempC > throttleTempC) {
-    const excessC = junctionTempC - throttleTempC;
-    thermalThrottledRatio = Math.max(0.22, 1 - 0.022 * excessC);
-    // Re-settle slightly lower sustained power & temp under throttling
-    dynPowerW *= Math.pow(thermalThrottledRatio, 1.8);
+    const uncappedPowerW = params.dynamicPowerAtTargetW + leakagePowerW + params.tunnelingPowerW;
+    if (uncappedPowerW > params.powerLimitW && params.dynamicPowerAtTargetW > 0.01) {
+      const allowedDyn = Math.max(
+        POWER_DYN_FLOOR * params.dynamicPowerAtTargetW,
+        params.powerLimitW - leakagePowerW - params.tunnelingPowerW
+      );
+      powerThrottledRatio = Math.max(
+        POWER_RATIO_FLOOR,
+        Math.min(1.0, Math.pow(allowedDyn / params.dynamicPowerAtTargetW, 1 / POWER_FREQ_EXPONENT))
+      );
+    } else {
+      powerThrottledRatio = 1.0;
+    }
+
+    dynPowerW = params.dynamicPowerAtTargetW * Math.pow(powerThrottledRatio, POWER_FREQ_EXPONENT);
     effectivePowerW = dynPowerW + leakagePowerW + params.tunnelingPowerW;
     heatFluxWPerMm2 = effectivePowerW / Math.max(params.dieAreaMm2, 1);
-    const rHotspot = 0.12 * Math.pow(Math.max(0.01, heatFluxWPerMm2), 0.6) * params.frontierFluxPenalty;
+    const rHotspot = evalHotspotR(heatFluxWPerMm2);
     junctionTempC = cooling.ambientTempC + effectivePowerW * (baseR + rHotspot);
   }
 
-  rawPowerW = params.dynamicPowerAtTargetW + leakagePowerW + params.tunnelingPowerW;
+  const dynAfterPowerCapW = dynPowerW;
+
+  // Step 2: Iterative thermal throttling loop (up to 6 passes, floor THERMAL_RATIO_FLOOR = 0.22)
+  // Converges smoothly to Tj <= throttleTempC so raising powerLimitW never reduces sustained clock.
+  let thermalThrottledRatio = 1.0;
+  if (junctionTempC > throttleTempC) {
+    const tempBudgetC = Math.max(0, throttleTempC - cooling.ambientTempC);
+    let pThermalEst = tempBudgetC / baseR;
+    const leakAtLimitW =
+      params.baseLeakageAt25CW * Math.exp((Math.max(-140, Math.min(180, throttleTempC)) - 25) / 42);
+
+    for (let iter = 0; iter < THERMAL_THROTTLE_MAX_ITERATIONS; iter++) {
+      const fluxEst = pThermalEst / Math.max(params.dieAreaMm2, 1);
+      const rHotEst = evalHotspotR(fluxEst);
+      const tjAtEst = cooling.ambientTempC + pThermalEst * (baseR + rHotEst);
+      const dTjPerW = baseR + 1.6 * rHotEst;
+      pThermalEst = Math.max(0, pThermalEst - (tjAtEst - throttleTempC) / Math.max(0.001, dTjPerW));
+
+      const refLeakW = Math.min(leakagePowerW, leakAtLimitW);
+      const allowedDynW = Math.max(0, pThermalEst - refLeakW - params.tunnelingPowerW);
+
+      thermalThrottledRatio = Math.max(
+        THERMAL_RATIO_FLOOR,
+        Math.min(
+          1.0,
+          Math.pow(allowedDynW / Math.max(0.01, dynAfterPowerCapW), 1 / POWER_FREQ_EXPONENT)
+        )
+      );
+
+      dynPowerW = dynAfterPowerCapW * Math.pow(thermalThrottledRatio, POWER_FREQ_EXPONENT);
+
+      // Re-settle leakage, heat flux, and Tj at the new throttled dynamic power
+      let settledTj = Math.min(junctionTempC, throttleTempC);
+      for (let s = 0; s < 2; s++) {
+        const tempArg = Math.max(-140, Math.min(180, settledTj));
+        leakagePowerW = params.baseLeakageAt25CW * Math.exp((tempArg - 25) / 42);
+        effectivePowerW = dynPowerW + leakagePowerW + params.tunnelingPowerW;
+        heatFluxWPerMm2 = effectivePowerW / Math.max(params.dieAreaMm2, 1);
+        const rHotNext = evalHotspotR(heatFluxWPerMm2);
+        settledTj = cooling.ambientTempC + effectivePowerW * (baseR + rHotNext);
+      }
+      junctionTempC = settledTj;
+
+      if (thermalThrottledRatio <= THERMAL_RATIO_FLOOR + 1e-9) {
+        break;
+      }
+      if (junctionTempC <= throttleTempC && throttleTempC - junctionTempC < 0.05) {
+        break;
+      }
+    }
+  }
+
+  const thermalFloorHit =
+    thermalThrottledRatio <= THERMAL_RATIO_FLOOR + 1e-9 && junctionTempC > throttleTempC;
+
+  const rawPowerW = params.dynamicPowerAtTargetW + leakagePowerW + params.tunnelingPowerW;
   const carnotOverheadW = effectivePowerW * cooling.carnotOverheadFactor;
 
   return {
@@ -278,6 +701,7 @@ function solveThermalAndPower(params: {
     junctionTempC,
     throttleTempC,
     thermalThrottledRatio,
+    thermalFloorHit,
     carnotOverheadW,
   };
 }
@@ -642,10 +1066,18 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
   const exceedsReticle = dieAreaMm2 > reticleLimitMm2;
 
   // 3. Voltage-Frequency wall & Power
-  const effectiveRefClockGHz = node.refClockGHz * arch.clockEfficiency * trans.clockMultiplier;
-  const clockRatio = spec.pClockGHz / Math.max(0.005, effectiveRefClockGHz);
-  const minStableVoltageV = Number(
-    (node.nominalVoltageV * (0.72 + 0.28 * Math.pow(Math.max(0.1, clockRatio), 1.85))).toFixed(3)
+  const effectiveRefClockGHz = getEffectiveRefClockGHz(
+    'cpu',
+    spec.processNodeId,
+    spec.architectureId,
+    spec.transistorStructureId
+  );
+  const minStableVoltageV = computeMinStableVoltageV(
+    'cpu',
+    spec.processNodeId,
+    spec.architectureId,
+    spec.transistorStructureId,
+    spec.pClockGHz
   );
   const voltageUnstable = spec.voltageV < minStableVoltageV - 0.005;
 
@@ -664,8 +1096,8 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
     eCoreTotalMTr *
     node.capacitanceFactor *
     arch.powerMultiplier *
-    0.85 *
-    Math.pow(spec.voltageV * 0.9, 2) *
+    E_CORE_POWER_FACTOR *
+    Math.pow(spec.voltageV * E_CORE_VOLTAGE_SCALE, 2) *
     spec.eClockGHz;
   const uncoreDyn =
     (cacheMTr * 0.06 + igpuMTr * 0.24 + npuMTr * 0.18) *
@@ -720,6 +1152,8 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
 
   // 5. Benchmarks & Roofline Bottleneck Analysis
   const memoryBandwidthGBs = spec.memoryChannels * mem.gbpsPerUnit;
+  const maxPcieGen = getMaxPcieGen(ctx.unlockedTechIds);
+  const pcieBandwidthGBs = spec.pcieLanes * getPcieBandwidthPerLaneGBs(maxPcieGen);
 
   // Diminishing-return cache multiplier
   const cacheGain =
@@ -747,16 +1181,22 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
   const bwSatisfaction = memoryBandwidthGBs / Math.max(0.1, memDemandGBs);
   const memRooflineFactor = Math.min(1.0, Math.pow(bwSatisfaction, 0.45));
 
+  // Diminishing-return PCIe I/O fabric multiplier for system compute and external GPU/storage feeding
+  const pcieComputeBonus = 1 + 0.045 * Math.log(1 + pcieBandwidthGBs / 4);
+  const pcieGamingBonus = 1 + 0.035 * Math.log(1 + pcieBandwidthGBs / 4);
+
   const multiCoreCpu = Math.round(singleCoreCpu * rawScaling * (0.35 + 0.65 * memRooflineFactor));
   const generalComputing = Math.round(
-    (singleCoreCpu * 0.32 + multiCoreCpu * 0.55) * isaComputeBonus +
-      spec.npuTier * 180 * Math.sqrt(Math.max(1, node.logicDensityMTrPerMm2))
+    ((singleCoreCpu * 0.32 + multiCoreCpu * 0.55) * isaComputeBonus +
+      spec.npuTier * 180 * Math.sqrt(Math.max(1, node.logicDensityMTrPerMm2))) *
+      pcieComputeBonus
   );
   const memoryPerformance = Math.round(memoryBandwidthGBs * 18 * (0.7 + 0.3 * Math.min(1.5, cacheGain)));
   const gamingRendering = Math.round(
-    singleCoreCpu * 0.42 +
+    (singleCoreCpu * 0.42 +
       Math.min(multiCoreCpu, singleCoreCpu * 5.5) * 0.25 +
-      spec.igpuTier * 220 * Math.sqrt(Math.max(0.5, sustainedClockGHz * memoryBandwidthGBs))
+      spec.igpuTier * 220 * Math.sqrt(Math.max(0.5, sustainedClockGHz * memoryBandwidthGBs))) *
+      pcieGamingBonus
   );
   const gpuCompute = Math.round(
     spec.igpuTier > 0
@@ -802,7 +1242,15 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
     });
   }
 
-  if (thermal.thermalThrottledRatio < 0.96) {
+  if (thermal.thermalFloorHit) {
+    bottlenecks.push({
+      id: 'thermal_runaway',
+      severity: 'critical',
+      title: 'Thermal Runaway — Minimum Throttle Floor Exceeded',
+      explanation: `Even at the ${(THERMAL_RATIO_FLOOR * 100).toFixed(0)}% clock throttle floor, junction temperature stays at ${thermal.junctionTempC.toFixed(1)} °C (limit ${thermal.throttleTempC} °C).`,
+      recommendation: 'Upgrade cooling solution immediately, lower core voltage/power limit, or reduce transistor count.',
+    });
+  } else if (thermal.thermalThrottledRatio < 0.96) {
     const lossPct = Math.round((1 - thermal.thermalThrottledRatio) * 100);
     bottlenecks.push({
       id: 'thermal_throttle',
@@ -831,6 +1279,17 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
       title: 'Memory Bandwidth Starvation',
       explanation: `${spec.memoryChannels}-channel ${mem.name} supplies ${memoryBandwidthGBs.toFixed(1)} GB/s against ~${memDemandGBs.toFixed(1)} GB/s multicore demand.`,
       recommendation: 'Add memory channels, unlock faster RAM generation, or enlarge L3 cache to shield cores from off-chip stalls.',
+    });
+  }
+
+  const pcieDemandGBs = Math.max(memoryBandwidthGBs * 0.25, effCoreCount * 0.8);
+  if (pcieBandwidthGBs < pcieDemandGBs && (totalCores >= 4 || memoryBandwidthGBs >= 16)) {
+    bottlenecks.push({
+      id: 'pcie_bottleneck',
+      severity: pcieBandwidthGBs < pcieDemandGBs * 0.5 ? 'warning' : 'info',
+      title: 'PCIe I/O Bandwidth Bottleneck',
+      explanation: `${spec.pcieLanes}× PCIe Gen ${maxPcieGen} provides ${pcieBandwidthGBs.toFixed(1)} GB/s against ~${pcieDemandGBs.toFixed(1)} GB/s system I/O demand.`,
+      recommendation: 'Add PCIe lanes or research higher PCIe generations to prevent off-package I/O starvation.',
     });
   }
 
@@ -892,7 +1351,6 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
   // Tape-out engineering cost & duration scale with complexity
   const complexity = Math.log10(10 + transistorCountMTr * 12) * (1 + totalCores * 0.04);
   const tapeOutCreditCost = Math.round(280 * complexity * (1 + dieAreaMm2 / 400));
-  const tapeOutRpCost = Math.round(18 * complexity);
   const tapeOutDays = Math.round(Math.min(540, (24 + complexity * 18) * frontier.tapeOutTimeMult));
 
   // Civilization compute contribution per good die
@@ -919,16 +1377,18 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
     junctionTempC: thermal.junctionTempC,
     throttleTempC: thermal.throttleTempC,
     thermalThrottledRatio: thermal.thermalThrottledRatio,
+    thermalFloorHit: thermal.thermalFloorHit,
     sustainedClockGHz,
     sustainedEClockGHz,
+    effectiveIpc,
     memoryBandwidthGBs,
+    pcieBandwidthGBs,
     grossDiesPerWafer,
     effectiveDefectDensity,
     yieldPercent,
     goodDiesPerWafer,
     floorplanBlocks,
     computePowerRating,
-    tapeOutRpCost,
     tapeOutCreditCost,
     tapeOutDays,
   };
@@ -996,11 +1456,13 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
   );
   const exceedsReticle = dieAreaMm2 > reticleLimitMm2;
 
-  // 3. Voltage-Frequency wall & Power
-  const effectiveRefClockGHz = node.refClockGHz * 0.72 * arch.clockEfficiency * trans.clockMultiplier;
-  const clockRatio = spec.clockGHz / Math.max(0.005, effectiveRefClockGHz);
-  const minStableVoltageV = Number(
-    (node.nominalVoltageV * (0.7 + 0.3 * Math.pow(Math.max(0.1, clockRatio), 1.85))).toFixed(3)
+  // 3. Voltage-Frequency wall & Power (unified curve across CPU & GPU)
+  const minStableVoltageV = computeMinStableVoltageV(
+    'gpu',
+    spec.processNodeId,
+    spec.architectureId,
+    spec.transistorStructureId,
+    spec.clockGHz
   );
   const voltageUnstable = spec.voltageV < minStableVoltageV - 0.005;
 
@@ -1062,7 +1524,8 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
   const effectiveBandwidthGBs = rawBandwidthGBs * arch.memoryCompression;
   const memoryBandwidthGBs = rawBandwidthGBs;
 
-  const l2CacheRelief = 1 + 0.14 * Math.log(1 + spec.l2CacheMB / 2);
+  const cacheRelief =
+    1 + 0.14 * Math.log(1 + spec.l2CacheMB / 2) + 0.04 * Math.log(1 + spec.l1CacheMB / 0.016);
   const peakGflops =
     spec.shaderCores *
     sustainedClockGHz *
@@ -1073,7 +1536,7 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
   // Pixel & Texel fill-rate demand vs shader compute
   const pixelFillScore = spec.rops * sustainedClockGHz * 14;
   const texelFillScore = spec.tmus * sustainedClockGHz * 7.5;
-  const bwScore = effectiveBandwidthGBs * l2CacheRelief * 3.8;
+  const bwScore = effectiveBandwidthGBs * cacheRelief * 3.8;
   const shaderScore = peakGflops * 1.15;
 
   // Harmonic-weighted roofline so any single severely starved subsystem visibly pulls down rendering!
@@ -1096,7 +1559,7 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
     1 / (0.62 / Math.max(1, peakGflops * arch.computeEfficiency * 1.25) + 0.38 / Math.max(1, bwScore));
   const gpuCompute = Math.round(computeHarmonic * (0.55 + 0.45 * vramFootprintRatio));
 
-  const memoryPerformance = Math.round(effectiveBandwidthGBs * 14 * l2CacheRelief);
+  const memoryPerformance = Math.round(effectiveBandwidthGBs * 14 * cacheRelief);
   const generalComputing = Math.round(gpuCompute * 0.72 + memoryPerformance * 0.12);
   const totalSystemPowerW = thermal.effectivePowerW + thermal.carnotOverheadW;
   const powerEfficiency = Math.round(((gamingRendering + gpuCompute) / 2 / Math.max(1, totalSystemPowerW)) * 10);
@@ -1172,7 +1635,15 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
     });
   }
 
-  if (thermal.thermalThrottledRatio < 0.96) {
+  if (thermal.thermalFloorHit) {
+    bottlenecks.push({
+      id: 'gpu_thermal_runaway',
+      severity: 'critical',
+      title: 'Thermal Runaway — Minimum Throttle Floor Exceeded',
+      explanation: `Even at the ${(THERMAL_RATIO_FLOOR * 100).toFixed(0)}% clock throttle floor, GPU junction temperature remains at ${thermal.junctionTempC.toFixed(1)} °C (limit ${thermal.throttleTempC} °C).`,
+      recommendation: 'Upgrade cooling solution immediately, lower voltage/power limit, or trim shader array footprint.',
+    });
+  } else if (thermal.thermalThrottledRatio < 0.96) {
     const lossPct = Math.round((1 - thermal.thermalThrottledRatio) * 100);
     bottlenecks.push({
       id: 'gpu_thermal',
@@ -1215,7 +1686,6 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
 
   const complexity = Math.log10(12 + transistorCountMTr * 10) * (1 + Math.log2(1 + spec.shaderCores) * 0.14);
   const tapeOutCreditCost = Math.round(320 * complexity * (1 + dieAreaMm2 / 420));
-  const tapeOutRpCost = Math.round(22 * complexity);
   const tapeOutDays = Math.round(Math.min(540, (28 + complexity * 19) * frontier.tapeOutTimeMult));
   const computePowerRating = Math.max(1, overallRating * 0.0135);
 
@@ -1241,6 +1711,7 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
       junctionTempC: thermal.junctionTempC,
       throttleTempC: thermal.throttleTempC,
       thermalThrottledRatio: thermal.thermalThrottledRatio,
+      thermalFloorHit: thermal.thermalFloorHit,
       sustainedClockGHz,
       memoryBandwidthGBs,
       grossDiesPerWafer,
@@ -1249,7 +1720,6 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
       goodDiesPerWafer,
       floorplanBlocks,
       computePowerRating,
-      tapeOutRpCost,
       tapeOutCreditCost,
       tapeOutDays,
     },

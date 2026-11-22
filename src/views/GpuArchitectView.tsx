@@ -11,8 +11,17 @@ import {
   PROCESS_NODES,
   TRANSISTOR_STRUCTURES,
 } from '../engine/catalog';
-import { evaluateGpuPhysics } from '../engine/physics';
-import { buildPhysicsContext, formatCompactNumber } from '../engine/simulation';
+import {
+  applyGpuArchChange,
+  applyGpuNodeChange,
+  applyGpuTransistorChange,
+  applyGpuVramChange,
+  clampToSlider,
+  evaluateGpuPhysics,
+  getGpuSliderBounds,
+  GPU_BUS_WIDTHS,
+} from '../engine/physics';
+import { buildPreviewPhysicsContext, formatCompactNumber } from '../engine/simulation';
 import type { GameState, GpuBlueprint } from '../engine/types';
 
 interface GpuArchitectViewProps {
@@ -24,8 +33,6 @@ interface GpuArchitectViewProps {
   onTestPrototype: () => void;
   onStartGpuUnlockResearch: () => void;
 }
-
-const BUS_WIDTHS = [64, 128, 192, 256, 384, 512, 1024, 2048, 4096];
 
 export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
   state,
@@ -64,11 +71,10 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
   const currentNode = getProcessNode(draft.processNodeId);
   const currentArch = getGpuArch(draft.architectureId);
 
-  const maxClockSlider = Number((currentNode.refClockGHz * 1.45 * currentArch.clockEfficiency).toFixed(3));
-  const clockStep = maxClockSlider < 0.2 ? 0.002 : maxClockSlider < 2 ? 0.02 : 0.05;
+  const sliderBounds = getGpuSliderBounds(draft);
 
   const evaluation = useMemo(() => {
-    const ctx = buildPhysicsContext(state, draft.processNodeId, 1, 1.0);
+    const ctx = buildPreviewPhysicsContext(state, draft.processNodeId, 1.0);
     return evaluateGpuPhysics(draft, ctx);
   }, [draft, state]);
 
@@ -114,21 +120,28 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
     });
   };
 
-  const handleNodeChange = (nodeId: string) => {
-    const n = getProcessNode(nodeId);
-    patch({
-      processNodeId: nodeId,
-      clockGHz: Number((n.refClockGHz * 0.72).toFixed(3)),
-      voltageV: n.nominalVoltageV,
+  const commitDraft = (next: GpuBlueprint) => {
+    setFeedback(null);
+    onUpdateDraft({
+      ...next,
+      revision: draft.revision + 1,
     });
   };
 
+  const handleNodeChange = (nodeId: string) => {
+    commitDraft(applyGpuNodeChange(draft, nodeId));
+  };
+
   const handleArchChange = (archId: string) => {
-    const a = getGpuArch(archId);
-    patch({
-      architectureId: archId,
-      shaderCores: Math.min(draft.shaderCores, a.maxShaderCores),
-    });
+    commitDraft(applyGpuArchChange(draft, archId));
+  };
+
+  const handleTransistorChange = (transId: string) => {
+    commitDraft(applyGpuTransistorChange(draft, transId));
+  };
+
+  const handleVramChange = (vramTechId: string) => {
+    commitDraft(applyGpuVramChange(draft, vramTechId));
   };
 
   const handleTapeOut = () => {
@@ -143,7 +156,7 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
     }
   };
 
-  const maxBusForVram = draft.vramTechId === 'vram_hbm' || draft.vramTechId === 'vram_photonic' ? 4096 : 512;
+  const maxBusForVram = sliderBounds.maxBusWidthBits;
 
   return (
     <div className="p-6 max-w-[1440px] mx-auto space-y-5">
@@ -249,7 +262,7 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 <span className="text-xs text-[#8C9BB2]">Transistor Structure</span>
                 <select
                   value={draft.transistorStructureId}
-                  onChange={(e) => patch({ transistorStructureId: e.target.value })}
+                  onChange={(e) => handleTransistorChange(e.target.value)}
                   className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
                 >
                   {unlockedTransistors.map((t) => (
@@ -292,10 +305,10 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={2}
-                  max={currentArch.maxShaderCores}
-                  step={currentArch.maxShaderCores > 2000 ? 64 : currentArch.maxShaderCores > 256 ? 8 : 2}
-                  value={draft.shaderCores}
+                  min={sliderBounds.shaderCores.min}
+                  max={sliderBounds.shaderCores.max}
+                  step={sliderBounds.shaderCores.step}
+                  value={clampToSlider(draft.shaderCores, sliderBounds.shaderCores)}
                   onChange={(e) => patch({ shaderCores: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -312,10 +325,10 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={Math.max(0.004, Number((currentNode.refClockGHz * 0.25).toFixed(3)))}
-                  max={maxClockSlider}
-                  step={clockStep}
-                  value={Math.min(draft.clockGHz, maxClockSlider)}
+                  min={sliderBounds.clockGHz.min}
+                  max={sliderBounds.clockGHz.max}
+                  step={sliderBounds.clockGHz.step}
+                  value={clampToSlider(draft.clockGHz, sliderBounds.clockGHz)}
                   onChange={(e) => patch({ clockGHz: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -328,10 +341,10 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={2}
-                  max={Math.max(16, Math.min(512, Math.round(currentArch.maxShaderCores / 16)))}
-                  step={2}
-                  value={draft.rops}
+                  min={sliderBounds.rops.min}
+                  max={sliderBounds.rops.max}
+                  step={sliderBounds.rops.step}
+                  value={clampToSlider(draft.rops, sliderBounds.rops)}
                   onChange={(e) => patch({ rops: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -344,10 +357,10 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={2}
-                  max={Math.max(32, Math.min(1024, Math.round(currentArch.maxShaderCores / 8)))}
-                  step={2}
-                  value={draft.tmus}
+                  min={sliderBounds.tmus.min}
+                  max={sliderBounds.tmus.max}
+                  step={sliderBounds.tmus.step}
+                  value={clampToSlider(draft.tmus, sliderBounds.tmus)}
                   onChange={(e) => patch({ tmus: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -368,10 +381,10 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={0.25}
-                  max={Math.max(1.8, currentNode.nominalVoltageV * 1.45)}
-                  step={0.02}
-                  value={draft.voltageV}
+                  min={sliderBounds.voltageV.min}
+                  max={sliderBounds.voltageV.max}
+                  step={sliderBounds.voltageV.step}
+                  value={clampToSlider(draft.voltageV, sliderBounds.voltageV)}
                   onChange={(e) => patch({ voltageV: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -389,7 +402,7 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 <span className="text-xs text-[#8C9BB2]">VRAM Memory Technology</span>
                 <select
                   value={draft.vramTechId}
-                  onChange={(e) => patch({ vramTechId: e.target.value })}
+                  onChange={(e) => handleVramChange(e.target.value)}
                   className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
                 >
                   {unlockedVram.map((m) => (
@@ -409,7 +422,7 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                   onChange={(e) => patch({ memoryBusWidthBits: Number(e.target.value) })}
                   className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
                 >
-                  {BUS_WIDTHS.filter((b) => b <= maxBusForVram).map((bits) => (
+                  {GPU_BUS_WIDTHS.filter((b) => b <= maxBusForVram).map((bits) => (
                     <option key={bits} value={bits}>
                       {bits}-bit Bus
                     </option>
@@ -428,11 +441,31 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={0.125}
-                  max={draft.vramTechId === 'vram_sdr' ? 2 : draft.vramTechId === 'vram_gddr5' ? 16 : 256}
-                  step={draft.vramTechId === 'vram_sdr' ? 0.125 : 2}
-                  value={draft.vramCapacityGB}
+                  min={sliderBounds.vramCapacityGB.min}
+                  max={sliderBounds.vramCapacityGB.max}
+                  step={sliderBounds.vramCapacityGB.step}
+                  value={clampToSlider(draft.vramCapacityGB, sliderBounds.vramCapacityGB)}
                   onChange={(e) => patch({ vramCapacityGB: Number(e.target.value) })}
+                  className="foundry-slider"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="text-[#8C9BB2]">Shader L1 Cache</span>
+                  <span className="font-mono tabular-nums text-[#E8EEF7]">
+                    {draft.l1CacheMB < 1
+                      ? `${Math.round(draft.l1CacheMB * 1024)} KB`
+                      : `${draft.l1CacheMB.toFixed(1)} MB`}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={sliderBounds.l1CacheMB.min}
+                  max={sliderBounds.l1CacheMB.max}
+                  step={sliderBounds.l1CacheMB.step}
+                  value={clampToSlider(draft.l1CacheMB, sliderBounds.l1CacheMB)}
+                  onChange={(e) => patch({ l1CacheMB: Number(e.target.value) })}
                   className="foundry-slider"
                 />
               </div>
@@ -446,10 +479,10 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={0.04}
-                  max={currentNode.featureSizeNm > 500 ? 2 : 192}
-                  step={currentNode.featureSizeNm > 500 ? 0.04 : 2}
-                  value={draft.l2CacheMB}
+                  min={sliderBounds.l2CacheMB.min}
+                  max={sliderBounds.l2CacheMB.max}
+                  step={sliderBounds.l2CacheMB.step}
+                  value={clampToSlider(draft.l2CacheMB, sliderBounds.l2CacheMB)}
                   onChange={(e) => patch({ l2CacheMB: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -462,16 +495,16 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={10}
-                  max={1400}
-                  step={10}
-                  value={draft.powerLimitW}
+                  min={sliderBounds.powerLimitW.min}
+                  max={sliderBounds.powerLimitW.max}
+                  step={sliderBounds.powerLimitW.step}
+                  value={clampToSlider(draft.powerLimitW, sliderBounds.powerLimitW)}
                   onChange={(e) => patch({ powerLimitW: Number(e.target.value) })}
                   className="foundry-slider"
                 />
               </div>
 
-              <label className="space-y-1 block">
+              <label className="space-y-1 block sm:col-span-2">
                 <span className="text-xs text-[#8C9BB2]">Cooling Solution</span>
                 <select
                   value={draft.coolingId}
@@ -544,7 +577,7 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
                 </span>
               </div>
               <div className="flex justify-between border-b border-[#1F2A3D] pb-1.5">
-                <span className="text-[#8C9BB2]">Murphy Yield</span>
+                <span className="text-[#8C9BB2]">Estimated yield (best fab)</span>
                 <span
                   className={`font-mono tabular-nums ${
                     physics.yieldPercent < 45 ? 'text-amber-400' : 'text-emerald-400'

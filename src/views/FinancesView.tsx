@@ -43,6 +43,8 @@ export const FinancesView: React.FC<FinancesViewProps> = ({ state, onAdjustStaff
     state.staff.fabrication +
     state.staff.qa;
 
+  const inDebt = Boolean(telemetry.inDebt) || state.credits < 0;
+
   return (
     <div className="p-6 max-w-[1440px] mx-auto space-y-6">
       {/* Header */}
@@ -56,9 +58,18 @@ export const FinancesView: React.FC<FinancesViewProps> = ({ state, onAdjustStaff
           </p>
         </div>
         <div className="text-sm font-mono tabular-nums text-[#E8EEF7]">
-          Treasury: <span className="text-[#22D3EE] font-semibold">{formatCompactNumber(state.credits, 1)} CR</span>
+          Treasury:{' '}
+          <span className={`font-semibold ${inDebt ? 'text-rose-400' : 'text-[#22D3EE]'}`}>
+            {formatCompactNumber(state.credits, 1)} CR{inDebt ? ' (In Debt)' : ''}
+          </span>
         </div>
       </div>
+
+      {inDebt && (
+        <div className="px-4 py-3 rounded-md bg-rose-950/50 border border-rose-500/40 text-xs text-rose-200">
+          <span className="font-semibold">Treasury In Debt:</span> New tape-outs, facility construction, and facility upgrades are suspended until credits return to a positive balance. Reduce payroll or expand chip compute shipments to restore surplus.
+        </div>
+      )}
 
       {/* Monthly Cash Flow Ledger Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

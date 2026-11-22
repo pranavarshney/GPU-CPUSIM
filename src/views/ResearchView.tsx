@@ -95,7 +95,7 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
 
           {state.activeResearch.length === 0 ? (
             <div className="p-5 rounded-md bg-[#0B0F17] border border-[#1F2A3D] text-xs text-[#8C9BB2]">
-              All laboratories are currently idle and banking 65% of daily RP for future breakthroughs or Frontier Synthesis. Select an available technology below to begin research.
+              All laboratories are currently idle and banking 100% of daily RP for future breakthroughs or Frontier Synthesis. Select an available technology below to begin research.
             </div>
           ) : (
             <div className="space-y-3">

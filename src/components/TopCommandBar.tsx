@@ -27,8 +27,9 @@ export const TopCommandBar: React.FC<TopCommandBarProps> = ({
     telemetry.powerCapacityMW > 0
       ? Math.round((telemetry.powerUsedMW / telemetry.powerCapacityMW) * 100)
       : 100;
+  const inDebt = Boolean(telemetry.inDebt) || state.credits < 0;
   const hasResourceAlert =
-    telemetry.siliconStarved || telemetry.powerDeficit || telemetry.packagingStarved;
+    inDebt || telemetry.siliconStarved || telemetry.powerDeficit || telemetry.packagingStarved;
 
   return (
     <header className="h-[52px] shrink-0 bg-[#0B0F17] border-b border-[#1F2A3D] px-4 flex items-center justify-between gap-4 select-none">
@@ -102,7 +103,11 @@ export const TopCommandBar: React.FC<TopCommandBarProps> = ({
       <div className="flex items-center gap-5 overflow-x-auto no-scrollbar">
         <div className="flex items-baseline gap-1.5 whitespace-nowrap">
           <span className="text-xs text-[#8C9BB2]">Credits</span>
-          <span className="font-mono tabular-nums text-sm font-semibold text-[#E8EEF7]">
+          <span
+            className={`font-mono tabular-nums text-sm font-semibold ${
+              inDebt ? 'text-rose-400' : 'text-[#E8EEF7]'
+            }`}
+          >
             {formatCompactNumber(state.credits, 1)}
           </span>
           <span
@@ -172,13 +177,19 @@ export const TopCommandBar: React.FC<TopCommandBarProps> = ({
       {/* Right: Resource Warning (if real) + Save / Load */}
       <div className="flex items-center gap-3 shrink-0">
         {hasResourceAlert && (
-          <span className="hidden lg:inline-flex items-center gap-1 text-xs font-medium text-amber-400 whitespace-nowrap">
+          <span
+            className={`hidden lg:inline-flex items-center gap-1 text-xs font-medium whitespace-nowrap ${
+              inDebt ? 'text-rose-400' : 'text-amber-400'
+            }`}
+          >
             <ShieldAlert className="w-3.5 h-3.5" />
-            {telemetry.powerDeficit
-              ? 'Power Deficit'
-              : telemetry.siliconStarved
-                ? 'Silicon Deficit'
-                : 'Packaging Cap'}
+            {inDebt
+              ? 'In Debt'
+              : telemetry.powerDeficit
+                ? 'Power Deficit'
+                : telemetry.siliconStarved
+                  ? 'Silicon Deficit'
+                  : 'Packaging Cap'}
           </span>
         )}
         {autosaveNotice && !hasResourceAlert && (

@@ -18,6 +18,7 @@ import {
   FACILITY_BLUEPRINTS,
   FRONTIER_TRACKS,
   getBestLithography,
+  getBestUnlockedProcessNode,
   getFrontierTrackCost,
   getMaxParallelResearch,
   getPackagingSpec,
@@ -64,6 +65,20 @@ export function formatCompactNumber(val: number, decimals = 1): string {
   return val.toFixed(decimals === 0 ? 0 : Math.min(decimals, 2)).replace(/\.00$/, '');
 }
 
+export function getQaStaffLevelBonus(qaStaff: number): number {
+  return Math.min(2, Math.floor(qaStaff / 12));
+}
+
+export function getBestFabCleanroomGrade(facilities: Facility[]): number {
+  let best = 1;
+  for (const fac of facilities) {
+    if (fac.kind === 'fab' && (fac.cleanroomGrade ?? 1) > best) {
+      best = fac.cleanroomGrade ?? 1;
+    }
+  }
+  return best;
+}
+
 export function buildPhysicsContext(
   state: GameState,
   nodeId: string,
@@ -80,6 +95,25 @@ export function buildPhysicsContext(
   };
 }
 
+/**
+ * Shared preview physics context used by Architects, Product Testing, and Tape-Out validation
+ * so preview yield matches best-fab production yield (including QA staff bonus).
+ */
+export function buildPreviewPhysicsContext(
+  state: GameState,
+  nodeId: string,
+  qaStrictness = 1.0
+): PhysicsContext {
+  const ctx = buildPhysicsContext(
+    state,
+    nodeId,
+    getBestFabCleanroomGrade(state.facilities),
+    qaStrictness
+  );
+  ctx.qaBudgetLevel = Math.min(5, state.qaBudgetLevel + getQaStaffLevelBonus(state.staff.qa));
+  return ctx;
+}
+
 export function createStarterCpuDraft(): CpuBlueprint {
   return {
     id: 'draft_cpu',
@@ -94,7 +128,7 @@ export function createStarterCpuDraft(): CpuBlueprint {
     architectureId: 'cpu_scalar',
     pCores: 1,
     eCores: 0,
-    pClockGHz: 0.012,
+    pClockGHz: 0.01,
     eClockGHz: 0.008,
     voltageV: 5.0,
     ipcTuning: 1.0,
@@ -105,7 +139,7 @@ export function createStarterCpuDraft(): CpuBlueprint {
     memoryTechId: 'ram_dram',
     memoryChannels: 1,
     pcieLanes: 4,
-    powerLimitW: 18,
+    powerLimitW: 20,
     igpuTier: 0,
     npuTier: 0,
     coolingId: 'cool_passive',
@@ -125,7 +159,7 @@ export function createStarterGpuDraft(): GpuBlueprint {
     packagingId: 'pkg_dip',
     architectureId: 'gpu_fixed',
     shaderCores: 4,
-    clockGHz: 0.01,
+    clockGHz: 0.006,
     voltageV: 5.0,
     vramCapacityGB: 0.125,
     vramTechId: 'vram_sdr',
@@ -164,11 +198,17 @@ export function createInitialState(): GameState {
     memoryTechId: 'ram_dram',
     memoryChannels: 1,
     pcieLanes: 4,
-    powerLimitW: 16,
+    powerLimitW: 15,
     igpuTier: 0,
     npuTier: 0,
     coolingId: 'cool_passive',
   };
+
+  const fabBp = FACILITY_BLUEPRINTS.fab;
+  const refBp = FACILITY_BLUEPRINTS.silicon_refinery;
+  const pwrBp = FACILITY_BLUEPRINTS.power_plant;
+  const labBp = FACILITY_BLUEPRINTS.research_lab;
+  const pkgBp = FACILITY_BLUEPRINTS.packaging_plant;
 
   const facilities: Facility[] = [
     {
@@ -176,47 +216,47 @@ export function createInitialState(): GameState {
       name: 'Foundry Alpha',
       kind: 'fab',
       level: 1,
-      waferCapacityPerMonth: 120,
+      waferCapacityPerMonth: fabBp.baseWaferCapacityPerMonth ?? 120,
       assignedNodeId: 'node_10000nm',
-      cleanroomGrade: 1,
-      monthlyUpkeepCR: 160,
-      powerDrawMW: 4,
+      cleanroomGrade: fabBp.baseCleanroomGrade ?? 1,
+      monthlyUpkeepCR: fabBp.monthlyUpkeepCR,
+      powerDrawMW: fabBp.powerDrawMW,
     },
     {
       id: 'ref_1',
       name: 'Silicon Refinery 01',
       kind: 'silicon_refinery',
       level: 1,
-      siliconOutputPerMonth: 950,
-      monthlyUpkeepCR: 65,
-      powerDrawMW: 6,
+      siliconOutputPerMonth: refBp.baseSiliconOutputPerMonth ?? 950,
+      monthlyUpkeepCR: refBp.monthlyUpkeepCR,
+      powerDrawMW: refBp.powerDrawMW,
     },
     {
       id: 'pwr_1',
       name: 'Substation Prime',
       kind: 'power_plant',
       level: 1,
-      powerCapacityMW: 35,
-      monthlyUpkeepCR: 55,
-      powerDrawMW: 0,
+      powerCapacityMW: pwrBp.basePowerCapacityMW ?? 35,
+      monthlyUpkeepCR: pwrBp.monthlyUpkeepCR,
+      powerDrawMW: pwrBp.powerDrawMW,
     },
     {
       id: 'lab_1',
       name: 'Central Physics Lab',
       kind: 'research_lab',
       level: 1,
-      researchOutputPerDay: 3.6,
-      monthlyUpkeepCR: 110,
-      powerDrawMW: 5,
+      researchOutputPerDay: labBp.baseResearchOutputPerDay ?? 3.6,
+      monthlyUpkeepCR: labBp.monthlyUpkeepCR,
+      powerDrawMW: labBp.powerDrawMW,
     },
     {
       id: 'pkg_1',
       name: 'OSAT Assembly Line 01',
       kind: 'packaging_plant',
       level: 1,
-      packagingCapacityPerMonth: 12000,
-      monthlyUpkeepCR: 75,
-      powerDrawMW: 4,
+      packagingCapacityPerMonth: pkgBp.basePackagingCapacityPerMonth ?? 12000,
+      monthlyUpkeepCR: pkgBp.monthlyUpkeepCR,
+      powerDrawMW: pkgBp.powerDrawMW,
     },
   ];
 
@@ -262,6 +302,7 @@ export function createInitialState(): GameState {
       siliconStarved: false,
       powerDeficit: false,
       packagingStarved: false,
+      inDebt: false,
     },
     unlockedTechIds: [],
     activeResearch: [],
@@ -377,7 +418,7 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
 
   // Staff multipliers
   const fabStaffBonus = Math.min(1.5, 0.72 + Math.log10(1 + state.staff.fabrication) * 0.42);
-  const qaStaffLevelBonus = Math.min(2, Math.floor(state.staff.qa / 12));
+  const qaStaffLevelBonus = getQaStaffLevelBonus(state.staff.qa);
 
   // Pass 1: Determine gross requested resources across production lines
   let requestedSiPerMonth = 0;
@@ -582,6 +623,7 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
       siliconStarved: siliconScale < 0.99,
       powerDeficit: totalPowerRequested > powerCapacityMW,
       packagingStarved: packagingScale < 0.99,
+      inDebt: state.credits < 0,
     },
   };
 }
@@ -659,7 +701,10 @@ export function advanceSimulationDays(
     const dailySiliconNet =
       (state.telemetry.monthlySiliconProd - state.telemetry.monthlySiliconConsumed) / 30;
 
-    let credits = Math.max(0, state.credits + dailyCreditNet);
+    let credits = state.credits + dailyCreditNet;
+    if ((credits < 0) !== Boolean(state.telemetry.inDebt)) {
+      needsTelemetryRefresh = true;
+    }
     const maxSiliconStorage = 4000 + state.telemetry.monthlySiliconProd * 4;
     let silicon = Math.max(0, Math.min(maxSiliconStorage, state.silicon + dailySiliconNet));
 
@@ -718,10 +763,10 @@ export function advanceSimulationDays(
       }
       activeResearch = remaining;
     } else {
-      // Bank excess RP for Frontier Refinements & Tape-Out acceleration (capped reasonably)
+      // Bank 100% of daily RP when no active research projects are running (capped reasonably)
       researchPointsBank = Math.min(
         5_000_000,
-        researchPointsBank + state.telemetry.rpPerDay * 0.65
+        researchPointsBank + state.telemetry.rpPerDay
       );
     }
 
@@ -795,7 +840,8 @@ export function advanceSimulationDays(
             });
           } else {
             const bp = FACILITY_BLUEPRINTS[job.kind];
-            const newId = `${job.kind}_${totalDays}_${Math.floor(Math.random() * 999)}`;
+            const newId = `${job.kind}_${totalDays}_${job.id}`;
+            const bestNode = getBestUnlockedProcessNode(unlockedTechIds);
             const newFac: Facility = {
               id: newId,
               name: job.name,
@@ -805,15 +851,23 @@ export function advanceSimulationDays(
               powerDrawMW: bp.powerDrawMW,
               ...(job.kind === 'fab'
                 ? {
-                    waferCapacityPerMonth: 120,
-                    assignedNodeId: 'node_10000nm',
-                    cleanroomGrade: 1,
+                    waferCapacityPerMonth: bp.baseWaferCapacityPerMonth ?? 120,
+                    assignedNodeId: bestNode.id,
+                    cleanroomGrade: bp.baseCleanroomGrade ?? 1,
                   }
                 : {}),
-              ...(job.kind === 'silicon_refinery' ? { siliconOutputPerMonth: 950 } : {}),
-              ...(job.kind === 'power_plant' ? { powerCapacityMW: 35 } : {}),
-              ...(job.kind === 'research_lab' ? { researchOutputPerDay: 3.2 } : {}),
-              ...(job.kind === 'packaging_plant' ? { packagingCapacityPerMonth: 12000 } : {}),
+              ...(job.kind === 'silicon_refinery'
+                ? { siliconOutputPerMonth: bp.baseSiliconOutputPerMonth ?? 950 }
+                : {}),
+              ...(job.kind === 'power_plant'
+                ? { powerCapacityMW: bp.basePowerCapacityMW ?? 35 }
+                : {}),
+              ...(job.kind === 'research_lab'
+                ? { researchOutputPerDay: bp.baseResearchOutputPerDay ?? 3.6 }
+                : {}),
+              ...(job.kind === 'packaging_plant'
+                ? { packagingCapacityPerMonth: bp.basePackagingCapacityPerMonth ?? 12000 }
+                : {}),
             };
             facilities = [...facilities, newFac];
             if (job.kind === 'fab') {
@@ -1026,7 +1080,7 @@ export function startChipTapeOut(
   draft: ChipBlueprint,
   cache: ChipMetricsCache
 ): { state: GameState; error?: string } {
-  const ctx = buildPhysicsContext(state, draft.processNodeId, 1, 1.0);
+  const ctx = buildPreviewPhysicsContext(state, draft.processNodeId, 1.0);
   const evalRes = cache.getOrCompute(draft, ctx, state.globalPhysicsRevision);
 
   if (evalRes.physics.exceedsReticle) {
@@ -1034,6 +1088,12 @@ export function startChipTapeOut(
   }
   if (evalRes.physics.voltageUnstable) {
     return { state, error: 'Core voltage is below Vmin stability threshold. Raise voltage or lower clock.' };
+  }
+  if (state.credits < 0) {
+    return {
+      state,
+      error: 'Company is in debt. Restore a positive treasury balance before initiating tape-outs.',
+    };
   }
   if (state.credits < evalRes.physics.tapeOutCreditCost) {
     return {
@@ -1090,6 +1150,9 @@ export function queueFacilityBuild(
   // Progressive infrastructure scaling cost (no arbitrary wafer fees)
   const scaledCost = Math.round(bp.buildCreditCost * Math.pow(1.22, existingCount));
 
+  if (state.credits < 0) {
+    return { state, error: 'Company is in debt. Restore a positive treasury balance before building facilities.' };
+  }
   if (state.credits < scaledCost) {
     return { state, error: `Requires ${scaledCost.toLocaleString()} CR.` };
   }
@@ -1127,6 +1190,9 @@ export function queueFacilityUpgrade(
   const upgradeCost = Math.round(
     bp.buildCreditCost * Math.pow(bp.upgradeCostMultiplier, fac.level)
   );
+  if (state.credits < 0) {
+    return { state, error: 'Company is in debt. Restore a positive treasury balance before upgrading facilities.' };
+  }
   if (state.credits < upgradeCost) {
     return { state, error: `Requires ${upgradeCost.toLocaleString()} CR.` };
   }

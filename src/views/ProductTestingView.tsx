@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { Archive, Copy } from 'lucide-react';
 import { getCpuArch, getGpuArch, getProcessNode } from '../engine/catalog';
 import { evaluateChip } from '../engine/physics';
-import { buildPhysicsContext } from '../engine/simulation';
+import { buildPreviewPhysicsContext } from '../engine/simulation';
 import type { ChipBenchmarkReport, ChipBlueprint, GameState } from '../engine/types';
 
 interface ProductTestingViewProps {
@@ -158,13 +158,13 @@ export const ProductTestingView: React.FC<ProductTestingViewProps> = ({
   const compareChip = allTestable.find((c) => c.id === compareId);
 
   const primaryEval = useMemo(() => {
-    const ctx = buildPhysicsContext(state, primaryChip.processNodeId, 1, 1.0);
+    const ctx = buildPreviewPhysicsContext(state, primaryChip.processNodeId, 1.0);
     return evaluateChip(primaryChip, ctx);
   }, [primaryChip, state]);
 
   const compareEval = useMemo(() => {
     if (!compareChip) return undefined;
-    const ctx = buildPhysicsContext(state, compareChip.processNodeId, 1, 1.0);
+    const ctx = buildPreviewPhysicsContext(state, compareChip.processNodeId, 1.0);
     return evaluateChip(compareChip, ctx);
   }, [compareChip, state]);
 
@@ -357,11 +357,17 @@ export const ProductTestingView: React.FC<ProductTestingViewProps> = ({
                 ['Transistor Count', `${primaryEval.physics.transistorCountMTr.toFixed(2)} MTr`],
                 ['Die Area / Reticle', `${primaryEval.physics.dieAreaMm2.toFixed(1)} / ${primaryEval.physics.reticleLimitMm2.toFixed(0)} mm²`],
                 ['Sustained Clock', primaryEval.physics.sustainedClockGHz < 1 ? `${Math.round(primaryEval.physics.sustainedClockGHz * 1000)} MHz` : `${primaryEval.physics.sustainedClockGHz.toFixed(2)} GHz`],
+                ...(primaryEval.physics.effectiveIpc !== undefined
+                  ? [['Effective IPC', `${primaryEval.physics.effectiveIpc.toFixed(2)} IPC`]]
+                  : []),
                 ['Dynamic / Leakage Power', `${primaryEval.physics.dynamicPowerW.toFixed(1)} W / ${(primaryEval.physics.leakagePowerW + primaryEval.physics.tunnelingPowerW).toFixed(1)} W`],
                 ['Junction Temp / Limit', `${primaryEval.physics.junctionTempC.toFixed(1)} °C / ${primaryEval.physics.throttleTempC} °C`],
                 ['Heat Flux Density', `${primaryEval.physics.heatFluxWPerMm2.toFixed(2)} W/mm²`],
                 ['Memory Bandwidth', `${primaryEval.physics.memoryBandwidthGBs.toFixed(1)} GB/s`],
-                ['Murphy Yield / Wafer', `${primaryEval.physics.yieldPercent.toFixed(1)}% (${primaryEval.physics.goodDiesPerWafer.toFixed(0)} good dies)`],
+                ...(primaryEval.physics.pcieBandwidthGBs !== undefined
+                  ? [['PCIe I/O Bandwidth', `${primaryEval.physics.pcieBandwidthGBs.toFixed(1)} GB/s`]]
+                  : []),
+                ['Estimated Yield (best fab)', `${primaryEval.physics.yieldPercent.toFixed(1)}% (${primaryEval.physics.goodDiesPerWafer.toFixed(0)} good dies)`],
               ].map(([k, v]) => (
                 <div key={k} className="py-2 flex items-center justify-between gap-2">
                   <span className="text-[#8C9BB2] font-sans">{k}</span>

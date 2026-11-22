@@ -1627,6 +1627,12 @@ export interface FacilityBlueprint {
   monthlyUpkeepCR: number;
   powerDrawMW: number;
   baseOutputLabel: string;
+  baseWaferCapacityPerMonth?: number;
+  baseCleanroomGrade?: number;
+  baseSiliconOutputPerMonth?: number;
+  basePowerCapacityMW?: number;
+  baseResearchOutputPerDay?: number;
+  basePackagingCapacityPerMonth?: number;
   upgradeCostMultiplier: number;
   upgradeDays: number;
 }
@@ -1641,6 +1647,8 @@ export const FACILITY_BLUEPRINTS: Record<FacilityKind, FacilityBlueprint> = {
     monthlyUpkeepCR: 160,
     powerDrawMW: 4,
     baseOutputLabel: '120 wafer starts/mo (L1)',
+    baseWaferCapacityPerMonth: 120,
+    baseCleanroomGrade: 1,
     upgradeCostMultiplier: 1.85,
     upgradeDays: 90,
   },
@@ -1653,6 +1661,7 @@ export const FACILITY_BLUEPRINTS: Record<FacilityKind, FacilityBlueprint> = {
     monthlyUpkeepCR: 65,
     powerDrawMW: 6,
     baseOutputLabel: '+950 Si/mo (L1)',
+    baseSiliconOutputPerMonth: 950,
     upgradeCostMultiplier: 1.65,
     upgradeDays: 45,
   },
@@ -1665,6 +1674,7 @@ export const FACILITY_BLUEPRINTS: Record<FacilityKind, FacilityBlueprint> = {
     monthlyUpkeepCR: 55,
     powerDrawMW: 0,
     baseOutputLabel: '+35 MW capacity (L1)',
+    basePowerCapacityMW: 35,
     upgradeCostMultiplier: 1.6,
     upgradeDays: 45,
   },
@@ -1676,7 +1686,8 @@ export const FACILITY_BLUEPRINTS: Record<FacilityKind, FacilityBlueprint> = {
     buildDays: 75,
     monthlyUpkeepCR: 110,
     powerDrawMW: 5,
-    baseOutputLabel: '+3.2 RP/day (L1)',
+    baseOutputLabel: '+3.6 RP/day (L1)',
+    baseResearchOutputPerDay: 3.6,
     upgradeCostMultiplier: 1.75,
     upgradeDays: 60,
   },
@@ -1689,6 +1700,7 @@ export const FACILITY_BLUEPRINTS: Record<FacilityKind, FacilityBlueprint> = {
     monthlyUpkeepCR: 75,
     powerDrawMW: 4,
     baseOutputLabel: '12,000 pkg units/mo (L1)',
+    basePackagingCapacityPerMonth: 12000,
     upgradeCostMultiplier: 1.7,
     upgradeDays: 50,
   },
@@ -1767,6 +1779,31 @@ export function getMaxPcieGen(unlockedTechIds: string[]): number {
     }
   }
   return gen;
+}
+
+export const PCIE_GBPS_PER_LANE: Record<number, number> = {
+  1: 0.25,
+  2: 0.5,
+  3: 1.0,
+  4: 2.0,
+  5: 4.0,
+  6: 8.0,
+};
+
+export function getPcieBandwidthPerLaneGBs(gen: number): number {
+  if (PCIE_GBPS_PER_LANE[gen] !== undefined) return PCIE_GBPS_PER_LANE[gen];
+  return 0.25 * Math.pow(2, Math.max(0, gen - 1));
+}
+
+export function getBestUnlockedProcessNode(unlockedTechIds: string[]): ProcessNodeSpec {
+  let best = PROCESS_NODES[0];
+  for (const node of PROCESS_NODES) {
+    const unlocked = !node.requiredTechId || unlockedTechIds.includes(node.requiredTechId);
+    if (unlocked && node.logicDensityMTrPerMm2 >= best.logicDensityMTrPerMm2) {
+      best = node;
+    }
+  }
+  return best;
 }
 
 export function getFrontierTrackCost(track: FrontierTrackSpec, currentLevel: number): number {

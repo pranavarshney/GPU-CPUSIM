@@ -311,14 +311,17 @@ export interface ChipPhysicsReport {
   thermalThrottledRatio: number; // 1.0 = no thermal throttle
   sustainedClockGHz: number;
   sustainedEClockGHz?: number;
+  effectiveIpc?: number;
   memoryBandwidthGBs: number;
+  pcieBandwidthGBs?: number;
+  thermalFloorHit?: boolean;
   grossDiesPerWafer: number;
   effectiveDefectDensity: number;
   yieldPercent: number;
   goodDiesPerWafer: number;
   floorplanBlocks: DieBlockRect[];
   computePowerRating: number; // Unified civilization compute contribution per good die
-  tapeOutRpCost: number;
+  tapeOutRpCost?: number;
   tapeOutCreditCost: number;
   tapeOutDays: number;
 }
@@ -477,6 +480,7 @@ export interface GameState {
     siliconStarved: boolean;
     powerDeficit: boolean;
     packagingStarved: boolean;
+    inDebt?: boolean;
   };
   unlockedTechIds: string[];
   activeResearch: ResearchProject[];

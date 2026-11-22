@@ -13,8 +13,15 @@ import {
   PROCESS_NODES,
   TRANSISTOR_STRUCTURES,
 } from '../engine/catalog';
-import { evaluateCpuPhysics } from '../engine/physics';
-import { buildPhysicsContext, formatCompactNumber } from '../engine/simulation';
+import {
+  applyCpuArchChange,
+  applyCpuNodeChange,
+  applyCpuTransistorChange,
+  clampToSlider,
+  evaluateCpuPhysics,
+  getCpuSliderBounds,
+} from '../engine/physics';
+import { buildPreviewPhysicsContext, formatCompactNumber } from '../engine/simulation';
 import type { CpuBlueprint, GameState } from '../engine/types';
 
 interface CpuArchitectViewProps {
@@ -65,11 +72,10 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
   const currentNode = getProcessNode(draft.processNodeId);
   const currentArch = getCpuArch(draft.architectureId);
 
-  const maxClockSlider = Number((currentNode.refClockGHz * 1.9 * currentArch.clockEfficiency).toFixed(3));
-  const clockStep = maxClockSlider < 0.2 ? 0.002 : maxClockSlider < 2 ? 0.02 : 0.05;
+  const sliderBounds = getCpuSliderBounds(draft);
 
   const evaluation = useMemo(() => {
-    const ctx = buildPhysicsContext(state, draft.processNodeId, 1, 1.0);
+    const ctx = buildPreviewPhysicsContext(state, draft.processNodeId, 1.0);
     return evaluateCpuPhysics(draft, ctx);
   }, [draft, state]);
 
@@ -84,24 +90,24 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
     });
   };
 
-  const handleNodeChange = (nodeId: string) => {
-    const n = getProcessNode(nodeId);
-    patch({
-      processNodeId: nodeId,
-      pClockGHz: Number(n.refClockGHz.toFixed(3)),
-      eClockGHz: Number((n.refClockGHz * 0.72).toFixed(3)),
-      voltageV: n.nominalVoltageV,
+  const commitDraft = (next: CpuBlueprint) => {
+    setFeedback(null);
+    onUpdateDraft({
+      ...next,
+      revision: draft.revision + 1,
     });
   };
 
+  const handleNodeChange = (nodeId: string) => {
+    commitDraft(applyCpuNodeChange(draft, nodeId));
+  };
+
   const handleArchChange = (archId: string) => {
-    const a = getCpuArch(archId);
-    patch({
-      architectureId: archId,
-      pCores: Math.min(draft.pCores, a.maxPCores),
-      eCores: a.supportsECores ? Math.min(draft.eCores, a.maxECores) : 0,
-      ipcTuning: Math.min(draft.ipcTuning, a.maxIpcTuning),
-    });
+    commitDraft(applyCpuArchChange(draft, archId));
+  };
+
+  const handleTransistorChange = (transId: string) => {
+    commitDraft(applyCpuTransistorChange(draft, transId));
   };
 
   const toggleIsa = (isaId: string) => {
@@ -231,7 +237,7 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                 <span className="text-xs text-[#8C9BB2]">Transistor Structure</span>
                 <select
                   value={draft.transistorStructureId}
-                  onChange={(e) => patch({ transistorStructureId: e.target.value })}
+                  onChange={(e) => handleTransistorChange(e.target.value)}
                   className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
                 >
                   {unlockedTransistors.map((t) => (
@@ -313,11 +319,17 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={Math.max(0.004, Number((currentNode.refClockGHz * 0.35).toFixed(3)))}
-                  max={maxClockSlider}
-                  step={clockStep}
-                  value={Math.min(draft.pClockGHz, maxClockSlider)}
-                  onChange={(e) => patch({ pClockGHz: Number(e.target.value) })}
+                  min={sliderBounds.pClockGHz.min}
+                  max={sliderBounds.pClockGHz.max}
+                  step={sliderBounds.pClockGHz.step}
+                  value={clampToSlider(draft.pClockGHz, sliderBounds.pClockGHz)}
+                  onChange={(e) => {
+                    const nextP = Number(e.target.value);
+                    patch({
+                      pClockGHz: nextP,
+                      eClockGHz: Math.min(draft.eClockGHz, nextP),
+                    });
+                  }}
                   className="foundry-slider"
                 />
               </div>
@@ -337,10 +349,10 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={0.25}
-                  max={Math.max(1.8, currentNode.nominalVoltageV * 1.45)}
-                  step={0.02}
-                  value={draft.voltageV}
+                  min={sliderBounds.voltageV.min}
+                  max={sliderBounds.voltageV.max}
+                  step={sliderBounds.voltageV.step}
+                  value={clampToSlider(draft.voltageV, sliderBounds.voltageV)}
                   onChange={(e) => patch({ voltageV: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -350,15 +362,15 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                 <div className="flex justify-between text-xs">
                   <span className="text-[#8C9BB2]">Microarchitecture IPC Tuning</span>
                   <span className="font-mono tabular-nums text-[#E8EEF7]">
-                    {(currentArch.baseIpc * draft.ipcTuning).toFixed(2)} IPC ({draft.ipcTuning.toFixed(2)}×)
+                    {(physics.effectiveIpc ?? currentArch.baseIpc * draft.ipcTuning).toFixed(2)} IPC ({draft.ipcTuning.toFixed(2)}×)
                   </span>
                 </div>
                 <input
                   type="range"
-                  min={0.85}
-                  max={currentArch.maxIpcTuning}
-                  step={0.05}
-                  value={draft.ipcTuning}
+                  min={sliderBounds.ipcTuning.min}
+                  max={sliderBounds.ipcTuning.max}
+                  step={sliderBounds.ipcTuning.step}
+                  value={clampToSlider(draft.ipcTuning, sliderBounds.ipcTuning)}
                   onChange={(e) => patch({ ipcTuning: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -376,10 +388,10 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                   </div>
                   <input
                     type="range"
-                    min={Math.max(0.004, Number((currentNode.refClockGHz * 0.25).toFixed(3)))}
-                    max={Math.max(draft.pClockGHz, 0.01)}
-                    step={clockStep}
-                    value={Math.min(draft.eClockGHz, draft.pClockGHz)}
+                    min={sliderBounds.eClockGHz.min}
+                    max={sliderBounds.eClockGHz.max}
+                    step={sliderBounds.eClockGHz.step}
+                    value={clampToSlider(draft.eClockGHz, sliderBounds.eClockGHz)}
                     onChange={(e) => patch({ eClockGHz: Number(e.target.value) })}
                     className="foundry-slider"
                   />
@@ -403,10 +415,10 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={2}
-                  max={256}
-                  step={2}
-                  value={draft.l1CacheKBPerCore}
+                  min={sliderBounds.l1CacheKBPerCore.min}
+                  max={sliderBounds.l1CacheKBPerCore.max}
+                  step={sliderBounds.l1CacheKBPerCore.step}
+                  value={clampToSlider(draft.l1CacheKBPerCore, sliderBounds.l1CacheKBPerCore)}
                   onChange={(e) => patch({ l1CacheKBPerCore: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -425,10 +437,10 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={0}
-                  max={currentNode.featureSizeNm > 1000 ? 0.25 : currentNode.featureSizeNm > 50 ? 16 : 128}
-                  step={currentNode.featureSizeNm > 1000 ? 0.004 : 0.5}
-                  value={draft.l2CacheMBTotal}
+                  min={sliderBounds.l2CacheMBTotal.min}
+                  max={sliderBounds.l2CacheMBTotal.max}
+                  step={sliderBounds.l2CacheMBTotal.step}
+                  value={clampToSlider(draft.l2CacheMBTotal, sliderBounds.l2CacheMBTotal)}
                   onChange={(e) => patch({ l2CacheMBTotal: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -443,10 +455,10 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={0}
-                  max={currentNode.featureSizeNm > 1000 ? 1 : currentNode.featureSizeNm > 50 ? 32 : 512}
-                  step={currentNode.featureSizeNm > 1000 ? 0.25 : 2}
-                  value={draft.l3CacheMBTotal}
+                  min={sliderBounds.l3CacheMBTotal.min}
+                  max={sliderBounds.l3CacheMBTotal.max}
+                  step={sliderBounds.l3CacheMBTotal.step}
+                  value={clampToSlider(draft.l3CacheMBTotal, sliderBounds.l3CacheMBTotal)}
                   onChange={(e) => patch({ l3CacheMBTotal: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -515,15 +527,17 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
 
               <div className="space-y-1.5">
                 <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">PCIe Lanes (Gen {maxPcieGen})</span>
+                  <span className="text-[#8C9BB2]">
+                    PCIe Lanes (Gen {maxPcieGen} · {(physics.pcieBandwidthGBs ?? 0).toFixed(1)} GB/s)
+                  </span>
                   <span className="font-mono tabular-nums text-[#E8EEF7]">{draft.pcieLanes} lanes</span>
                 </div>
                 <input
                   type="range"
-                  min={4}
-                  max={128}
-                  step={4}
-                  value={draft.pcieLanes}
+                  min={sliderBounds.pcieLanes.min}
+                  max={sliderBounds.pcieLanes.max}
+                  step={sliderBounds.pcieLanes.step}
+                  value={clampToSlider(draft.pcieLanes, sliderBounds.pcieLanes)}
                   onChange={(e) => patch({ pcieLanes: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -536,10 +550,10 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={5}
-                  max={1200}
-                  step={5}
-                  value={draft.powerLimitW}
+                  min={sliderBounds.powerLimitW.min}
+                  max={sliderBounds.powerLimitW.max}
+                  step={sliderBounds.powerLimitW.step}
+                  value={clampToSlider(draft.powerLimitW, sliderBounds.powerLimitW)}
                   onChange={(e) => patch({ powerLimitW: Number(e.target.value) })}
                   className="foundry-slider"
                 />
@@ -658,7 +672,7 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
                 </span>
               </div>
               <div className="flex justify-between border-b border-[#1F2A3D] pb-1.5">
-                <span className="text-[#8C9BB2]">Murphy Yield</span>
+                <span className="text-[#8C9BB2]">Estimated yield (best fab)</span>
                 <span
                   className={`font-mono tabular-nums ${
                     physics.yieldPercent < 45 ? 'text-amber-400' : 'text-emerald-400'
