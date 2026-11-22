@@ -1,0 +1,6 @@
+{
+  "name": "Semiconductor Empire",
+  "description": "An open-ended semiconductor engineering and grand strategy monopoly simulator starting in Year 0001 with non-linear silicon physics, live 2D die floorplans, and a zoomable technology tree.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
