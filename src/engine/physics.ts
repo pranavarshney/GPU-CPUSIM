@@ -75,6 +75,13 @@
  *      Random Access Latency/IOPS (bank parallelism vs. multi-bit voltage sensing & ECC overhead),
  *      Areal Bit Density (Gbit/mm^2), and Program/Erase Endurance TBW (SLC..PLC vs. LDPC ECC).
  *
+ * 7. CUMULATIVE R&D ENGINEERING MODIFIERS (590+ Tech Tree Nodes):
+ *    Aggregated via getAggregatedTechModifiers(unlockedTechIds) with smooth physical caps:
+ *    - logicDensityMult (≤3.5×), sramDensityMult (≤3.0×), defectReductionMult (≥0.25×),
+ *      leakageReductionMult (≥0.25×), clockHeadroomMult (≤1.45×, lowers V_min & switching energy),
+ *      ipcBonusMult (≤2.4×), gpuComputeMult (≤2.8×), memoryBandwidthMult (≤2.8×),
+ *      coolingEfficiencyMult (≤2.2×).
+ *
  * LIMITATIONS:
  *    - Steady-state DC thermal equilibrium (no transient ms turbo thermal capacitance).
  *    - Uniform-random defect clustering approximated via Murphy squared-Poisson formula.
@@ -82,6 +89,7 @@
  */
 
 import {
+  getAggregatedTechModifiers,
   getBestLithography,
   getCoolingSpec,
   getCpuArch,
@@ -233,6 +241,12 @@ export const PHYSICS_DOCUMENTATION: PhysicsDocEntry[] = [
     equation: 'Cost(L) = RP_0 · r^L  |  Gain(L) = c · ln(1 + k · L)',
     units: 'RP, dimensionless multiplier',
     assumptions: 'Exponential RP escalation, logarithmic diminishing returns, plus physical trade-offs (Carnot overhead, flux sensitivity, metrology power).',
+  },
+  {
+    title: 'Cumulative R&D Engineering Modifiers',
+    equation: 'M_k = clamp(∏_{t ∈ U} m_{k,t}, cap_min, cap_max)',
+    units: 'dimensionless multiplier',
+    assumptions: '590+ research nodes compound smoothly into density, defect D0, leakage, clock voltage headroom, IPC, GPU compute, memory BW, and thermal efficiency within physical caps.',
   },
 ];
 
@@ -1424,6 +1438,7 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
   const litho = getBestLithography(ctx.unlockedTechIds);
   const waferDia = getMaxWaferDiameterMm(ctx.unlockedTechIds);
   const frontier = computeFrontierModifiers(ctx.frontierLevels);
+  const techMods = getAggregatedTechModifiers(ctx.unlockedTechIds);
 
   // 1. ISA extensions impact
   let isaOverhead = 0;
@@ -1462,9 +1477,16 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
   const transistorCountMTr = logicMTr + cacheMTr;
 
   // 2. Die area (mm^2)
-  const effLogicDensity = node.logicDensityMTrPerMm2 * trans.densityMultiplier * frontier.densityMult;
+  const effLogicDensity =
+    node.logicDensityMTrPerMm2 *
+    trans.densityMultiplier *
+    frontier.densityMult *
+    techMods.logicDensityMult;
   const effSramDensity =
-    node.sramDensityMTrPerMm2 * Math.sqrt(trans.densityMultiplier) * frontier.densityMult;
+    node.sramDensityMTrPerMm2 *
+    Math.sqrt(trans.densityMultiplier) *
+    frontier.densityMult *
+    techMods.sramDensityMult;
 
   const totalCores = spec.pCores + spec.eCores;
   const routingOverhead = 0.09 + 0.018 * Math.log2(1 + totalCores);
@@ -1492,22 +1514,27 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
     spec.architectureId,
     spec.transistorStructureId
   );
-  const minStableVoltageV = computeMinStableVoltageV(
+  const rawMinStableVoltageV = computeMinStableVoltageV(
     'cpu',
     spec.processNodeId,
     spec.architectureId,
     spec.transistorStructureId,
     spec.pClockGHz
   );
+  const minStableVoltageV = Number(
+    (rawMinStableVoltageV / Math.pow(techMods.clockHeadroomMult, 0.35)).toFixed(3)
+  );
   const voltageUnstable = spec.voltageV < minStableVoltageV - 0.005;
 
   // Dynamic switching power: P_dyn = alpha * C_eff * V^2 * f
+  const clockSwitchEff = 1 / Math.pow(techMods.clockHeadroomMult, 0.22);
   const pDyn =
     0.42 *
     pCoreTotalMTr *
     node.capacitanceFactor *
     arch.powerMultiplier *
     isaPowerPenalty *
+    clockSwitchEff *
     spec.voltageV *
     spec.voltageV *
     spec.pClockGHz;
@@ -1517,11 +1544,13 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
     node.capacitanceFactor *
     arch.powerMultiplier *
     E_CORE_POWER_FACTOR *
+    clockSwitchEff *
     Math.pow(spec.voltageV * E_CORE_VOLTAGE_SCALE, 2) *
     spec.eClockGHz;
   const uncoreDyn =
     (cacheMTr * 0.06 + igpuMTr * 0.24 + npuMTr * 0.18) *
     node.capacitanceFactor *
+    clockSwitchEff *
     spec.voltageV *
     spec.voltageV *
     Math.min(spec.pClockGHz, effectiveRefClockGHz) +
@@ -1530,7 +1559,11 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
 
   const dynamicPowerAtTargetW = Math.max(0.25, pDyn + eDyn + uncoreDyn);
   const baseLeakageAt25CW =
-    node.leakageCoeff * trans.leakageMultiplier * transistorCountMTr * spec.voltageV;
+    node.leakageCoeff *
+    trans.leakageMultiplier *
+    techMods.leakageReductionMult *
+    transistorCountMTr *
+    spec.voltageV;
   const tunnelingPowerW =
     node.tunnelingFloorWPerMTr * (1 - trans.tunnelingMitigation) * transistorCountMTr;
 
@@ -1543,7 +1576,7 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
     coolingId: spec.coolingId,
     packagingId: spec.packagingId,
     transistorId: spec.transistorStructureId,
-    frontierThermalMult: frontier.thermalResMult,
+    frontierThermalMult: frontier.thermalResMult / techMods.coolingEfficiencyMult,
     frontierFluxPenalty: frontier.fluxPenaltyMult,
   });
 
@@ -1561,7 +1594,8 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
     pkg.defectMultiplier *
     cleanroomMult *
     maturationMult *
-    frontier.defectMult;
+    frontier.defectMult *
+    techMods.defectReductionMult;
 
   const qaFactor = 0.94 + ctx.qaBudgetLevel * 0.015 + ((ctx.qaStrictness ?? 1.0) - 1.0) * 0.04;
   const grossDiesPerWafer = exceedsReticle ? 0 : computeGrossDiesPerWafer(waferDia, dieAreaMm2);
@@ -1571,7 +1605,7 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
   const goodDiesPerWafer = (grossDiesPerWafer * yieldPercent) / 100;
 
   // 5. Benchmarks & Roofline Bottleneck Analysis
-  const memoryBandwidthGBs = spec.memoryChannels * mem.gbpsPerUnit;
+  const memoryBandwidthGBs = spec.memoryChannels * mem.gbpsPerUnit * techMods.memoryBandwidthMult;
   const maxPcieGen = getMaxPcieGen(ctx.unlockedTechIds);
   const pcieBandwidthGBs = spec.pcieLanes * getPcieBandwidthPerLaneGBs(maxPcieGen);
 
@@ -1582,7 +1616,7 @@ export function evaluateCpuPhysics(spec: CpuBlueprint, ctx: PhysicsContext): Chi
     0.11 * Math.log(1 + spec.l2CacheMBTotal / Math.max(0.5, totalCores * 0.25)) +
     0.13 * Math.log(1 + spec.l3CacheMBTotal / Math.max(1, totalCores * 1.5));
 
-  const effectiveIpc = arch.baseIpc * spec.ipcTuning * frontier.ipcMult;
+  const effectiveIpc = arch.baseIpc * spec.ipcTuning * frontier.ipcMult * techMods.ipcBonusMult;
   const stabilityPenalty = voltageUnstable ? 0.35 : 1.0;
 
   const singleCoreCpu = Math.round(
@@ -1845,6 +1879,7 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
   const litho = getBestLithography(ctx.unlockedTechIds);
   const waferDia = getMaxWaferDiameterMm(ctx.unlockedTechIds);
   const frontier = computeFrontierModifiers(ctx.frontierLevels);
+  const techMods = getAggregatedTechModifiers(ctx.unlockedTechIds);
 
   // 1. Transistor budget
   const shaderMTr = spec.shaderCores * arch.shaderMTrPerCore;
@@ -1858,9 +1893,16 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
   const transistorCountMTr = logicMTr + cacheMTr;
 
   // 2. Die Area (mm^2)
-  const effLogicDensity = node.logicDensityMTrPerMm2 * trans.densityMultiplier * frontier.densityMult;
+  const effLogicDensity =
+    node.logicDensityMTrPerMm2 *
+    trans.densityMultiplier *
+    frontier.densityMult *
+    techMods.logicDensityMult;
   const effSramDensity =
-    node.sramDensityMTrPerMm2 * Math.sqrt(trans.densityMultiplier) * frontier.densityMult;
+    node.sramDensityMTrPerMm2 *
+    Math.sqrt(trans.densityMultiplier) *
+    frontier.densityMult *
+    techMods.sramDensityMult;
 
   const routingOverhead = 0.11 + 0.014 * Math.log2(1 + spec.shaderCores / 16);
   const shaderArea = (shaderMTr / effLogicDensity) * (1 + routingOverhead);
@@ -1877,15 +1919,19 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
   const exceedsReticle = dieAreaMm2 > reticleLimitMm2;
 
   // 3. Voltage-Frequency wall & Power (unified curve across CPU & GPU)
-  const minStableVoltageV = computeMinStableVoltageV(
+  const rawMinStableVoltageV = computeMinStableVoltageV(
     'gpu',
     spec.processNodeId,
     spec.architectureId,
     spec.transistorStructureId,
     spec.clockGHz
   );
+  const minStableVoltageV = Number(
+    (rawMinStableVoltageV / Math.pow(techMods.clockHeadroomMult, 0.35)).toFixed(3)
+  );
   const voltageUnstable = spec.voltageV < minStableVoltageV - 0.005;
 
+  const clockSwitchEff = 1 / Math.pow(techMods.clockHeadroomMult, 0.22);
   const vramBoardPowerW = busSlices * vram.powerPerChannelW * 0.55 + Math.log2(1 + spec.vramCapacityGB) * 1.8;
   const dynamicPowerAtTargetW = Math.max(
     0.5,
@@ -1893,6 +1939,7 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
       (shaderMTr + ropTmuMTr * 0.7 + cacheMTr * 0.12) *
       node.capacitanceFactor *
       arch.powerMultiplier *
+      clockSwitchEff *
       spec.voltageV *
       spec.voltageV *
       spec.clockGHz +
@@ -1900,7 +1947,11 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
   );
 
   const baseLeakageAt25CW =
-    node.leakageCoeff * trans.leakageMultiplier * transistorCountMTr * spec.voltageV;
+    node.leakageCoeff *
+    trans.leakageMultiplier *
+    techMods.leakageReductionMult *
+    transistorCountMTr *
+    spec.voltageV;
   const tunnelingPowerW =
     node.tunnelingFloorWPerMTr * (1 - trans.tunnelingMitigation) * transistorCountMTr;
 
@@ -1913,7 +1964,7 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
     coolingId: spec.coolingId,
     packagingId: spec.packagingId,
     transistorId: spec.transistorStructureId,
-    frontierThermalMult: frontier.thermalResMult,
+    frontierThermalMult: frontier.thermalResMult / techMods.coolingEfficiencyMult,
     frontierFluxPenalty: frontier.fluxPenaltyMult,
   });
 
@@ -1930,7 +1981,8 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
     pkg.defectMultiplier *
     cleanroomMult *
     maturationMult *
-    frontier.defectMult;
+    frontier.defectMult *
+    techMods.defectReductionMult;
 
   const qaFactor = 0.94 + ctx.qaBudgetLevel * 0.015 + ((ctx.qaStrictness ?? 1.0) - 1.0) * 0.04;
   const grossDiesPerWafer = exceedsReticle ? 0 : computeGrossDiesPerWafer(waferDia, dieAreaMm2);
@@ -1940,7 +1992,7 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
   const goodDiesPerWafer = (grossDiesPerWafer * yieldPercent) / 100;
 
   // 5. Roofline Performance Model
-  const rawBandwidthGBs = busSlices * vram.gbpsPerUnit;
+  const rawBandwidthGBs = busSlices * vram.gbpsPerUnit * techMods.memoryBandwidthMult;
   const effectiveBandwidthGBs = rawBandwidthGBs * arch.memoryCompression;
   const memoryBandwidthGBs = rawBandwidthGBs;
 
@@ -1951,6 +2003,7 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
     sustainedClockGHz *
     arch.opsPerCorePerClock *
     frontier.ipcMult *
+    techMods.gpuComputeMult *
     (voltageUnstable ? 0.35 : 1.0);
 
   // Pixel & Texel fill-rate demand vs shader compute
@@ -2285,6 +2338,7 @@ export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext
   const litho = getBestLithography(ctx.unlockedTechIds);
   const waferDia = getMaxWaferDiameterMm(ctx.unlockedTechIds);
   const frontier = computeFrontierModifiers(ctx.frontierLevels);
+  const techMods = getAggregatedTechModifiers(ctx.unlockedTechIds);
 
   const stackLayers = Math.max(1, Math.min(cellArch.maxStackLayers, spec.stackLayers));
   const bitsPerCell = Math.max(1, Math.min(cellArch.maxBitsPerCell, spec.bitsPerCell));
@@ -2299,7 +2353,8 @@ export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext
   const nodeDensityScale =
     Math.pow(node.sramDensityMTrPerMm2 / 44, 0.72) *
     Math.sqrt(trans.densityMultiplier) *
-    frontier.densityMult;
+    frontier.densityMult *
+    Math.sqrt(techMods.sramDensityMult);
   const layerAlpha = cellArch.category === 'rom_nand' ? 0.91 : 0.94;
   const effectiveLayerGain = Math.pow(stackLayers, layerAlpha);
   const effectiveDensityGbitPerMm2 =
@@ -2307,7 +2362,11 @@ export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext
     (1 + eccMeta.areaOverhead);
 
   // Periphery CMOS logic (Sense Amps, ECC controller, I/O PHY)
-  const effLogicDensity = node.logicDensityMTrPerMm2 * trans.densityMultiplier * frontier.densityMult;
+  const effLogicDensity =
+    node.logicDensityMTrPerMm2 *
+    trans.densityMultiplier *
+    frontier.densityMult *
+    techMods.logicDensityMult;
   const busSlices = Math.max(1, spec.busWidthBits / 16);
 
   const senseAmpMTr = Math.max(0.04, spec.bankCount * Math.pow(node.logicDensityMTrPerMm2, 0.45) * 0.42);
@@ -2351,7 +2410,7 @@ export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext
     spec.interfaceId,
     spec.transistorStructureId
   );
-  const minStableVoltageV = computeMinStableMemoryVoltageV(
+  const rawMinStableVoltageV = computeMinStableMemoryVoltageV(
     spec.processNodeId,
     spec.cellArchId,
     spec.interfaceId,
@@ -2359,14 +2418,20 @@ export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext
     spec.dataRateMTs,
     bitsPerCell
   );
+  const minStableVoltageV = Number(
+    (rawMinStableVoltageV / Math.pow(techMods.clockHeadroomMult, 0.35)).toFixed(3)
+  );
   const voltageUnstable = spec.voltageV < minStableVoltageV - 0.005;
 
   const rateRatio = spec.dataRateMTs / Math.max(10, effRefRateMTs);
   const voltNorm = spec.voltageV / Math.max(0.4, node.nominalVoltageV);
+  const clockSwitchEff = 1 / Math.pow(techMods.clockHeadroomMult, 0.22);
 
-  const phyDynW = busSlices * iface.phyPowerPerSliceW * voltNorm * voltNorm * Math.pow(rateRatio, 1.35);
+  const phyDynW =
+    busSlices * iface.phyPowerPerSliceW * clockSwitchEff * voltNorm * voltNorm * Math.pow(rateRatio, 1.35);
   const arrayDynW =
     cellArch.activePowerFactor *
+    clockSwitchEff *
     Math.sqrt(Math.max(0.5, spec.bankCount)) *
     Math.pow(Math.max(0.01, spec.capacityGB), 0.2) *
     (1 + (bitsPerCell - 1) * 0.14) *
@@ -2378,11 +2443,15 @@ export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext
 
   const refreshPowerAt25W = cellArch.nonVolatile
     ? 0
-    : cellArch.refreshPowerFactor * Math.pow(Math.max(0.001, spec.capacityGB), 0.52) * voltNorm;
+    : cellArch.refreshPowerFactor *
+      techMods.leakageReductionMult *
+      Math.pow(Math.max(0.001, spec.capacityGB), 0.52) *
+      voltNorm;
 
   const peripheryLeakAt25W =
     node.leakageCoeff *
     trans.leakageMultiplier *
+    techMods.leakageReductionMult *
     (logicMTr + Math.sqrt(Math.max(0.1, arrayCellsM)) * 0.14) *
     spec.voltageV;
   const baseLeakageAt25CW = peripheryLeakAt25W + refreshPowerAt25W;
@@ -2406,7 +2475,7 @@ export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext
     coolingId: spec.coolingId,
     packagingId: spec.packagingId,
     transistorId: spec.transistorStructureId,
-    frontierThermalMult: frontier.thermalResMult,
+    frontierThermalMult: frontier.thermalResMult / techMods.coolingEfficiencyMult,
     frontierFluxPenalty: frontier.fluxPenaltyMult,
     extraThermalResistanceCPerW: stackThermalR,
     throttleTempOverrideC: cellArch.id === 'mem_photonic_holo' ? 78 : undefined,
@@ -2437,7 +2506,8 @@ export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext
     eccRescueFactor *
     cleanroomMult *
     maturationMult *
-    frontier.defectMult;
+    frontier.defectMult *
+    techMods.defectReductionMult;
 
   const qaFactor = 0.94 + ctx.qaBudgetLevel * 0.015 + ((ctx.qaStrictness ?? 1.0) - 1.0) * 0.04;
   const grossDiesPerWafer = exceedsReticle ? 0 : computeGrossDiesPerWafer(waferDia, dieAreaMm2);
@@ -2449,7 +2519,10 @@ export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext
   // 4. Bandwidth, Latency, Endurance & Benchmarks
   const stabilityPenalty = voltageUnstable ? 0.35 : 1.0;
   const memoryBandwidthGBs =
-    (spec.busWidthBits / 8) * (sustainedDataRateMTs / 1000) * stabilityPenalty;
+    (spec.busWidthBits / 8) *
+    (sustainedDataRateMTs / 1000) *
+    techMods.memoryBandwidthMult *
+    stabilityPenalty;
 
   const bankRelief = 1 / (1 + 0.09 * Math.log2(Math.max(1, spec.bankCount / 4)));
   const rateRelief = Math.pow(effRefRateMTs / Math.max(10, sustainedDataRateMTs), 0.32);
@@ -2727,7 +2800,7 @@ export class ChipMetricsCache {
     // Discretize maturation XP to integer buckets so minor daily increments don't thrash cache
     const matBucket = Math.floor(ctx.maturationXp);
     const strictBucket = Math.round((ctx.qaStrictness ?? 1.0) * 20);
-    const key = `${chip.id}|r${chip.revision}|g${globalRevision}|m${matBucket}|c${ctx.cleanroomGrade}|q${ctx.qaBudgetLevel}|s${strictBucket}`;
+    const key = `${chip.id}|r${chip.revision}|g${globalRevision}|t${ctx.unlockedTechIds.length}|m${matBucket}|c${ctx.cleanroomGrade}|q${ctx.qaBudgetLevel}|s${strictBucket}`;
     const existing = this.map.get(key);
     if (existing) return existing;
 

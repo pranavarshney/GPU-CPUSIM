@@ -1,10 +1,11 @@
-import React, { useState } from 'react';
-import { FlaskConical, GitBranch, XCircle, Sparkles } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { FlaskConical, GitBranch, Search, Sparkles, XCircle } from 'lucide-react';
 import {
   FRONTIER_TRACKS,
   getFrontierTrackCost,
   getMaxParallelResearch,
   getTechNode,
+  TECH_LANE_MAP,
   TECH_TREE,
 } from '../engine/catalog';
 import { canResearchTech, formatCompactNumber } from '../engine/simulation';
@@ -37,16 +38,30 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
   onNavigate,
 }) => {
   const [filterCat, setFilterCat] = useState<'all' | TechCategory>('all');
+  const [searchQuery, setSearchQuery] = useState('');
   const maxSlots = getMaxParallelResearch(state.unlockedTechIds);
   const frontierUnlocked = state.unlockedTechIds.includes('fab_07nm');
 
-  const availableTechs = TECH_TREE.filter((t) => {
-    if (state.unlockedTechIds.includes(t.id)) return false;
-    if (state.activeResearch.some((r) => r.techId === t.id)) return false;
-    const prereqsMet = t.prerequisites.every((p) => state.unlockedTechIds.includes(p));
-    if (!prereqsMet) return false;
-    return filterCat === 'all' || t.category === filterCat;
-  });
+  const availableTechs = useMemo(() => {
+    const unlockedSet = new Set(state.unlockedTechIds);
+    const activeSet = new Set(state.activeResearch.map((r) => r.techId));
+    const q = searchQuery.trim().toLowerCase();
+
+    return TECH_TREE.filter((t) => {
+      if (unlockedSet.has(t.id)) return false;
+      if (activeSet.has(t.id)) return false;
+      if (!t.prerequisites.every((p) => unlockedSet.has(p))) return false;
+      if (filterCat !== 'all' && t.category !== filterCat) return false;
+      if (q) {
+        const match =
+          t.name.toLowerCase().includes(q) ||
+          t.summary.toLowerCase().includes(q) ||
+          t.unlocksSummary.some((u) => u.toLowerCase().includes(q));
+        if (!match) return false;
+      }
+      return true;
+    }).sort((a, b) => a.tier - b.tier || a.rpCost - b.rpCost);
+  }, [state.unlockedTechIds, state.activeResearch, filterCat, searchQuery]);
 
   const handleBudgetSlider = (key: keyof DepartmentBudgets, value: number) => {
     onUpdateBudgets({
@@ -70,7 +85,8 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
           <h1 className="text-2xl font-bold text-[#E8EEF7] tracking-tight">Research &amp; Laboratories</h1>
           <p className="text-sm text-[#8C9BB2] mt-0.5">
             Output {state.telemetry.rpPerDay.toFixed(1)} RP/day · {state.activeResearch.length}/
-            {maxSlots} parallel slots · {formatCompactNumber(state.researchPointsBank, 0)} RP banked
+            {maxSlots} parallel slots · {state.unlockedTechIds.length}/{TECH_TREE.length} unlocked ·{' '}
+            {formatCompactNumber(state.researchPointsBank, 0)} RP banked
           </p>
         </div>
         <button
@@ -79,19 +95,19 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
           className="h-9 px-3.5 rounded-md bg-[#111622] hover:bg-[#171E2E] text-[#E8EEF7] border border-[#2C3B55] text-xs font-medium flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
         >
           <GitBranch className="w-3.5 h-3.5 text-[#06B6D4]" />
-          <span>Inspect Full Tech Tree</span>
+          <span>Inspect Full Tech Tree ({TECH_TREE.length})</span>
         </button>
       </div>
 
       {/* Top Row: Active Research Slots + Department Priority Allocation */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         <div className="lg:col-span-7 bg-[#111622] border border-[#1F2A3D] rounded-lg p-5 space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-[#E8EEF7]">
               Active Research Queue ({state.activeResearch.length}/{maxSlots})
             </h2>
             <span className="text-xs text-[#8C9BB2]">
-              Unlock SDRAM, Liquid Cooling &amp; Immersion for up to 4 parallel slots
+              Research Lab Infrastructure &amp; CPU Architecture unlock up to 8 parallel slots
             </span>
           </div>
 
@@ -118,7 +134,7 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
                           {tech?.name ?? proj.techId}
                         </div>
                         <div className="text-xs text-[#8C9BB2]">
-                          {tech ? CATEGORY_LABELS[tech.category] : ''} · Est. {etaDays} days remaining
+                          {tech ? `${TECH_LANE_MAP[tech.lane]?.shortLabel ?? CATEGORY_LABELS[tech.category]} · Tier ${tech.tier}` : ''} · Est. {etaDays} days remaining
                         </div>
                       </div>
                       <button
@@ -189,33 +205,46 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
           <h2 className="text-sm font-semibold text-[#E8EEF7]">
             Available Research Projects ({availableTechs.length})
           </h2>
-          <div className="flex flex-wrap items-center gap-1 bg-[#0B0F17] border border-[#1F2A3D] rounded-md p-0.5">
-            {(['all', 'fabrication', 'cpu', 'gpu', 'memory', 'support', 'frontier'] as const).map((cat) => (
-              <button
-                key={cat}
-                type="button"
-                onClick={() => setFilterCat(cat)}
-                className={`px-2.5 py-1 text-xs rounded-[4px] transition-colors whitespace-nowrap cursor-pointer ${
-                  filterCat === cat
-                    ? 'bg-[#171E2E] text-[#E8EEF7]'
-                    : 'text-[#8C9BB2] hover:text-[#E8EEF7]'
-                }`}
-              >
-                {cat === 'all' ? 'All Domains' : CATEGORY_LABELS[cat]}
-              </button>
-            ))}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Filter available projects..."
+                className="h-8 pl-8 pr-3 w-52 rounded-md bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7] placeholder:text-[#64748B]"
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-1 bg-[#0B0F17] border border-[#1F2A3D] rounded-md p-0.5">
+              {(['all', 'fabrication', 'cpu', 'gpu', 'memory', 'support', 'frontier'] as const).map((cat) => (
+                <button
+                  key={cat}
+                  type="button"
+                  onClick={() => setFilterCat(cat)}
+                  className={`px-2.5 py-1 text-xs rounded-[4px] transition-colors whitespace-nowrap cursor-pointer ${
+                    filterCat === cat
+                      ? 'bg-[#171E2E] text-[#E8EEF7]'
+                      : 'text-[#8C9BB2] hover:text-[#E8EEF7]'
+                  }`}
+                >
+                  {cat === 'all' ? 'All Domains' : CATEGORY_LABELS[cat]}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
         {availableTechs.length === 0 ? (
           <div className="p-4 rounded-md bg-[#0B0F17] border border-[#1F2A3D] text-xs text-[#8C9BB2]">
-            No additional technologies currently available in this category. Complete active research or inspect dependencies in the Technology Tree.
+            No additional technologies currently available in this filter. Complete active research or inspect dependencies in the Technology Tree.
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5">
             {availableTechs.map((tech) => {
               const check = canResearchTech(state, tech.id);
               const etaDays = Math.ceil(tech.rpCost / Math.max(0.5, state.telemetry.rpPerDay));
+              const laneMeta = TECH_LANE_MAP[tech.lane];
               return (
                 <div
                   key={tech.id}
@@ -223,7 +252,9 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
                 >
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between gap-2 text-[11px] text-[#8C9BB2]">
-                      <span>{CATEGORY_LABELS[tech.category]} · Tier {tech.tier}</span>
+                      <span style={{ color: laneMeta?.accent }}>
+                        {laneMeta?.shortLabel ?? CATEGORY_LABELS[tech.category]} · T{tech.tier}
+                      </span>
                       <span className="font-mono tabular-nums text-[#22D3EE]">
                         {tech.rpCost.toLocaleString()} RP
                       </span>

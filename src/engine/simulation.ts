@@ -17,6 +17,7 @@
 import {
   FACILITY_BLUEPRINTS,
   FRONTIER_TRACKS,
+  getAggregatedTechModifiers,
   getBestLithography,
   getBestUnlockedProcessNode,
   getFrontierTrackCost,
@@ -467,13 +468,9 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
   const metrologyPowerMult = 1 + 0.04 * ftDefectLvl;
   const thermalSiMult = 1 + 0.03 * ftThermalLvl;
 
-  let techRpMult = 1.0;
-  let techSiEff = 1.0;
-  for (const tid of state.unlockedTechIds) {
-    const t = getTechNode(tid);
-    if (t?.effects?.rpMultiplier) techRpMult *= t.effects.rpMultiplier;
-    if (t?.effects?.siliconEfficiency) techSiEff *= t.effects.siliconEfficiency;
-  }
+  const techMods = getAggregatedTechModifiers(state.unlockedTechIds);
+  const techRpMult = techMods.rpGenerationMult;
+  const techSiEff = techMods.siliconRefiningMult;
 
   let powerCapacityMW = 0;
   let baseFacilityPowerMW = 0;
@@ -493,7 +490,8 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
     } else if (fac.kind === 'silicon_refinery') {
       monthlySiliconProd += (fac.siliconOutputPerMonth ?? 0) * techSiEff;
     } else if (fac.kind === 'packaging_plant') {
-      packagingCapacityPerMonth += fac.packagingCapacityPerMonth ?? 0;
+      packagingCapacityPerMonth +=
+        (fac.packagingCapacityPerMonth ?? 0) * Math.sqrt(techMods.fabThroughputMult);
     } else if (fac.kind === 'research_lab') {
       baseLabRpPerDay += fac.researchOutputPerDay ?? 0;
     }
@@ -534,7 +532,7 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
     }
     const node = getProcessNode(chip.processNodeId);
     const pkg = getPackagingSpec(chip.packagingId);
-    const maxWafers = (fab.waferCapacityPerMonth ?? 100) * fabStaffBonus;
+    const maxWafers = (fab.waferCapacityPerMonth ?? 100) * fabStaffBonus * techMods.fabThroughputMult;
     // Stricter QA trades a bit of throughput for yield & reliability
     const qaThroughputFactor = 1.12 - line.qaStrictness * 0.12;
     const waferTarget = Math.min(line.targetWaferStartsPerMonth, maxWafers * qaThroughputFactor);
@@ -694,8 +692,9 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
   );
 
   // Civilization Demand Credit Income (CR/month)
-  // Scales organically from Year 0001 (~1,400 CR/mo) across futuristic millennia without inflation runaway
-  const techTierFactor = 1 + state.unlockedTechIds.length * 0.14;
+  // Scales organically from Year 0001 (~1,400 CR/mo) across 590+ techs & millennia without inflation runaway
+  const techTierFactor =
+    1 + Math.log2(1 + state.unlockedTechIds.length) * 0.85 + state.unlockedTechIds.length * 0.015;
   const monthlyCreditIncome = Math.round(
     (220 + Math.pow(totalDeliveredCompute * ecosystemBonus, 0.56) * 24) *
       Math.pow(techTierFactor, 0.62)

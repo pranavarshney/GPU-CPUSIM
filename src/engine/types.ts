@@ -19,6 +19,15 @@ export type MainSection =
 
 export type TechCategory = 'fabrication' | 'cpu' | 'gpu' | 'memory' | 'support' | 'frontier';
 
+export type TechLaneId =
+  | 'fabrication'
+  | 'lithography'
+  | 'transistors'
+  | 'cpu'
+  | 'gpu'
+  | 'memory'
+  | 'packaging';
+
 export type MemoryCategory = 'dram' | 'vram' | 'rom_nand' | 'storage_class';
 
 export type FrontierParadigmId = 'none' | 'cryogenic' | 'photonic' | 'cnt_3d' | 'topological';
@@ -206,10 +215,74 @@ export interface IsaExtensionSpec {
   requiredTechId?: string;
 }
 
+export interface TechEffects {
+  waferDiameterMm?: number;
+  cleanroomDefectMult?: number;
+  lithoId?: string;
+  rpMultiplier?: number;
+  siliconEfficiency?: number;
+  powerEfficiency?: number;
+  maxParallelResearch?: number;
+  maxPcieGen?: number;
+  unlocksIgpuMaxTier?: number;
+  unlocksNpuMaxTier?: number;
+  unlocksParadigm?: FrontierParadigmId;
+  /** Cumulative engineering modifiers aggregated across unlocked tech nodes */
+  logicDensityMult?: number;
+  sramDensityMult?: number;
+  defectReductionMult?: number;
+  leakageReductionMult?: number;
+  clockHeadroomMult?: number;
+  ipcBonusMult?: number;
+  gpuComputeMult?: number;
+  memoryBandwidthMult?: number;
+  coolingEfficiencyMult?: number;
+  siliconRefiningMult?: number;
+  fabThroughputMult?: number;
+  rpGenerationMult?: number;
+}
+
+export interface TechModifiers {
+  logicDensityMult: number;
+  sramDensityMult: number;
+  defectReductionMult: number;
+  leakageReductionMult: number;
+  clockHeadroomMult: number;
+  ipcBonusMult: number;
+  gpuComputeMult: number;
+  memoryBandwidthMult: number;
+  coolingEfficiencyMult: number;
+  siliconRefiningMult: number;
+  fabThroughputMult: number;
+  rpGenerationMult: number;
+  maxParallelResearch: number;
+  maxPcieGen: number;
+  waferDiameterMm: number;
+}
+
+export interface TechLaneMeta {
+  id: TechLaneId;
+  label: string;
+  shortLabel: string;
+  accent: string;
+  headerY: number;
+  rowYs: number[];
+}
+
+export interface TechEraBanner {
+  id: string;
+  label: string;
+  subtitle: string;
+  startTier: number;
+  endTier: number;
+  accent: string;
+}
+
 export interface TechNode {
   id: string;
   name: string;
   category: TechCategory;
+  lane: TechLaneId;
   tier: number;
   rpCost: number;
   prerequisites: string[];
@@ -220,20 +293,8 @@ export interface TechNode {
   unlocksSummary: string[];
   /** New engineering trade-off or physical constraint introduced */
   constraintWarning?: string;
-  /** Optional global modifiers */
-  effects?: {
-    waferDiameterMm?: number;
-    cleanroomDefectMult?: number;
-    lithoId?: string;
-    rpMultiplier?: number;
-    siliconEfficiency?: number;
-    powerEfficiency?: number;
-    maxParallelResearch?: number;
-    maxPcieGen?: number;
-    unlocksIgpuMaxTier?: number;
-    unlocksNpuMaxTier?: number;
-    unlocksParadigm?: FrontierParadigmId;
-  };
+  /** Optional global & cumulative engineering modifiers */
+  effects?: TechEffects;
 }
 
 export interface FrontierTrackSpec {

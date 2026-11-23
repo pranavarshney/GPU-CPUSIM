@@ -8,11 +8,20 @@ import {
   COOLING_SPECS,
   CPU_ARCHITECTURES,
   FACILITY_BLUEPRINTS,
+  getAggregatedTechModifiers,
   getBestUnlockedProcessNode,
   GPU_ARCHITECTURES,
+  ISA_EXTENSIONS,
+  LITHOGRAPHY_SPECS,
   MEMORY_CELL_ARCHS,
   MEMORY_INTERFACES,
+  MEMORY_TECHS,
+  PACKAGING_SPECS,
   PROCESS_NODES,
+  TECH_LANES,
+  TECH_NODE_H,
+  TECH_NODE_W,
+  TECH_TREE,
   TRANSISTOR_STRUCTURES,
 } from './catalog';
 import {
@@ -875,6 +884,201 @@ test('16. migrateGameState upgrades legacy saves missing memoryDraft, researchBu
   assert.equal(typeof migrated.telemetry.hasActiveMemory, 'boolean');
   assert.equal(typeof migrated.telemetry.monthlyMemoryCapacityTB, 'number');
   assert.ok(migrated.telemetry.monthlyMemoryDiesByCategory !== undefined);
+});
+
+// ─── TEST 17: 520+ Node Tech Tree DAG, Coordinate, and Mechanical-Effect Integrity ──
+test('17. Expanded Tech Tree has >= 520 unique nodes across 7 lanes with valid DAG, 0 overlaps, and 0 empty filler nodes', () => {
+  assert.ok(
+    TECH_TREE.length >= 520,
+    `Expected >= 520 tech nodes, got ${TECH_TREE.length}`
+  );
+  assert.equal(TECH_LANES.length, 7, 'Expected exactly 7 engineering lanes');
+
+  const ids = new Set<string>();
+  const names = new Set<string>();
+  const laneCounts = new Map<string, number>();
+
+  for (const node of TECH_TREE) {
+    assert.ok(!ids.has(node.id), `Duplicate tech node id: ${node.id}`);
+    assert.ok(!names.has(node.name), `Duplicate tech node name: ${node.name}`);
+    ids.add(node.id);
+    names.add(node.name);
+    laneCounts.set(node.lane, (laneCounts.get(node.lane) ?? 0) + 1);
+    assert.ok(node.tier >= 1 && node.tier <= 26, `Invalid tier ${node.tier} on ${node.id}`);
+    assert.ok(node.rpCost > 0, `Invalid rpCost on ${node.id}`);
+  }
+
+  for (const lane of TECH_LANES) {
+    const count = laneCounts.get(lane.id) ?? 0;
+    assert.ok(count >= 60, `Expected >= 60 nodes in lane ${lane.id}, got ${count}`);
+  }
+
+  // Every prerequisite must exist and DAG must have 0 cycles (Kahn topological sort)
+  const inDegree = new Map<string, number>();
+  const adj = new Map<string, string[]>();
+  for (const node of TECH_TREE) {
+    inDegree.set(node.id, node.prerequisites.length);
+    for (const preId of node.prerequisites) {
+      assert.ok(ids.has(preId), `Missing prerequisite ${preId} referenced by ${node.id}`);
+      const list = adj.get(preId) ?? [];
+      list.push(node.id);
+      adj.set(preId, list);
+    }
+  }
+
+  const queue: string[] = [];
+  for (const [id, deg] of inDegree) {
+    if (deg === 0) queue.push(id);
+  }
+  let visited = 0;
+  while (queue.length > 0) {
+    const u = queue.shift()!;
+    visited += 1;
+    for (const v of adj.get(u) ?? []) {
+      const nextDeg = (inDegree.get(v) ?? 1) - 1;
+      inDegree.set(v, nextDeg);
+      if (nextDeg === 0) queue.push(v);
+    }
+  }
+  assert.equal(
+    visited,
+    TECH_TREE.length,
+    `Detected cycle in Tech Tree DAG (${TECH_TREE.length - visited} nodes unreachable)`
+  );
+
+  // Zero overlapping (x, y) node bounding boxes
+  for (let i = 0; i < TECH_TREE.length; i++) {
+    const a = TECH_TREE[i];
+    for (let j = i + 1; j < TECH_TREE.length; j++) {
+      const b = TECH_TREE[j];
+      const overlaps =
+        Math.abs(a.x - b.x) < TECH_NODE_W && Math.abs(a.y - b.y) < TECH_NODE_H;
+      assert.ok(
+        !overlaps,
+        `Overlapping tech nodes: ${a.id} (${a.x},${a.y}) and ${b.id} (${b.x},${b.y})`
+      );
+    }
+  }
+
+  // Every catalog requiredTechId must exist in TECH_TREE, and every node must unlock hardware or have effects
+  const catalogUnlockIds = new Set<string>();
+  const catalogGroups = [
+    PROCESS_NODES,
+    LITHOGRAPHY_SPECS,
+    TRANSISTOR_STRUCTURES,
+    PACKAGING_SPECS,
+    COOLING_SPECS,
+    CPU_ARCHITECTURES,
+    GPU_ARCHITECTURES,
+    MEMORY_TECHS,
+    MEMORY_CELL_ARCHS,
+    MEMORY_INTERFACES,
+    ISA_EXTENSIONS,
+  ];
+  for (const group of catalogGroups) {
+    for (const item of group as Array<{ requiredTechId?: string }>) {
+      if (item.requiredTechId) {
+        assert.ok(
+          ids.has(item.requiredTechId),
+          `Catalog requiredTechId missing from TECH_TREE: ${item.requiredTechId}`
+        );
+        catalogUnlockIds.add(item.requiredTechId);
+      }
+    }
+  }
+
+  for (const node of TECH_TREE) {
+    const hasEffect = Boolean(node.effects && Object.keys(node.effects).length > 0);
+    const unlocksCatalog = catalogUnlockIds.has(node.id);
+    assert.ok(
+      hasEffect || unlocksCatalog,
+      `Tech node ${node.id} has neither catalog unlock nor mechanical effects`
+    );
+  }
+});
+
+// ─── TEST 18: Cumulative Tech Modifiers cleanly improve Physics & Simulation without breaking invariants ──
+test('18. Cumulative TechModifiers improve CPU/GPU/Memory physics & simulation cleanly up to 100% completion', () => {
+  const allTechIds = TECH_TREE.map((t) => t.id);
+  const fullMods = getAggregatedTechModifiers(allTechIds);
+  assert.equal(fullMods.maxParallelResearch, 8, 'Expected 8 max parallel research slots at full tree');
+  assert.equal(fullMods.maxPcieGen, 10, 'Expected PCIe Gen 10 at full tree');
+  assert.equal(fullMods.waferDiameterMm, 600, 'Expected 600 mm wafer diameter at full tree');
+  assert.ok(fullMods.logicDensityMult > 1.5 && fullMods.logicDensityMult <= 3.5);
+  assert.ok(fullMods.defectReductionMult >= 0.25 && fullMods.defectReductionMult < 0.8);
+
+  const emptyCtx: PhysicsContext = { ...BASE_CTX, unlockedTechIds: [] };
+  const fullCtx: PhysicsContext = { ...BASE_CTX, unlockedTechIds: allTechIds };
+
+  const cpu = {
+    ...createStarterCpuDraft(),
+    processNodeId: 'node_14nm',
+    architectureId: 'cpu_ooo',
+    transistorStructureId: 'trans_finfet',
+    packagingId: 'pkg_lga',
+    coolingId: 'cool_liquid',
+    pCores: 8,
+    eCores: 4,
+    pClockGHz: 3.6,
+    eClockGHz: 2.6,
+    voltageV: 1.05,
+    l1CacheKBPerCore: 64,
+    l2CacheMBTotal: 8,
+    l3CacheMBTotal: 32,
+    memoryTechId: 'ram_ddr5',
+    memoryChannels: 4,
+    pcieLanes: 16,
+    powerLimitW: 250,
+  };
+  const cpuBase = evaluateCpuPhysics(cpu, emptyCtx);
+  const cpuFull = evaluateCpuPhysics(cpu, fullCtx);
+  assert.ok(cpuFull.physics.dieAreaMm2 < cpuBase.physics.dieAreaMm2, 'Full R&D should shrink CPU die area');
+  assert.ok(cpuFull.physics.yieldPercent > cpuBase.physics.yieldPercent, 'Full R&D should improve CPU wafer yield');
+  assert.ok(cpuFull.physics.effectiveIpc! > cpuBase.physics.effectiveIpc!, 'Full R&D should boost CPU IPC');
+  assert.ok(cpuFull.benchmarks.overallRating > cpuBase.benchmarks.overallRating, 'Full R&D should boost CPU rating');
+  assert.equal(cpuFull.physics.voltageUnstable, false, 'Full R&D must keep nominal CPU voltage-stable');
+  assert.ok(Number.isFinite(cpuFull.physics.junctionTempC), 'CPU junction temp must remain finite');
+
+  const gpu = {
+    ...createStarterGpuDraft(),
+    processNodeId: 'node_14nm',
+    architectureId: 'gpu_unified',
+    transistorStructureId: 'trans_finfet',
+    packagingId: 'pkg_lga',
+    coolingId: 'cool_liquid',
+    shaderCores: 2048,
+    rops: 64,
+    tmus: 128,
+    clockGHz: 1.5,
+    voltageV: 1.0,
+    vramTechId: 'vram_gddr5',
+    memoryBusWidthBits: 256,
+    vramCapacityGB: 8,
+    l1CacheMB: 2,
+    l2CacheMB: 16,
+    powerLimitW: 350,
+  };
+  const gpuBase = evaluateGpuPhysics(gpu, emptyCtx);
+  const gpuFull = evaluateGpuPhysics(gpu, fullCtx);
+  assert.ok(gpuFull.physics.dieAreaMm2 < gpuBase.physics.dieAreaMm2, 'Full R&D should shrink GPU die area');
+  assert.ok(gpuFull.benchmarks.gpuCompute > gpuBase.benchmarks.gpuCompute, 'Full R&D should boost GPU compute');
+  assert.ok(gpuFull.physics.memoryBandwidthGBs > gpuBase.physics.memoryBandwidthGBs, 'Full R&D should boost GPU bandwidth');
+
+  const mem = createStarterMemoryDraft();
+  const memBase = evaluateMemoryPhysics(mem, emptyCtx);
+  const memFull = evaluateMemoryPhysics(mem, fullCtx);
+  assert.ok(memFull.physics.memoryBandwidthGBs > memBase.physics.memoryBandwidthGBs, 'Full R&D should boost memory bandwidth');
+  assert.ok(memFull.physics.yieldPercent >= memBase.physics.yieldPercent, 'Full R&D should maintain/improve memory yield');
+
+  // Simulation telemetry scaling with all 592 techs unlocked
+  const baseState = createInitialState();
+  const fullState = recomputeTelemetry(
+    { ...baseState, unlockedTechIds: allTechIds, globalPhysicsRevision: baseState.globalPhysicsRevision + 1 },
+    new ChipMetricsCache()
+  );
+  assert.ok(fullState.telemetry.rpPerDay > baseState.telemetry.rpPerDay * 2, 'Lab RP/day should scale strongly with R&D');
+  assert.ok(fullState.telemetry.monthlySiliconProd > baseState.telemetry.monthlySiliconProd * 1.5, 'Silicon refining should scale with R&D');
+  assert.ok(Number.isFinite(fullState.telemetry.monthlyCreditIncome) && fullState.telemetry.monthlyCreditIncome > 0);
 });
 
 console.log(`\nAll ${passed} audit verification tests passed.`);
