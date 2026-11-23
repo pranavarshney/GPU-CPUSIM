@@ -718,7 +718,7 @@ export const MemoryArchitectView: React.FC<MemoryArchitectViewProps> = ({
                       y="11"
                       fill="#8C9BB2"
                       fontSize="8"
-                      fontFamily="JetBrains Mono, monospace"
+                      fontFamily="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace"
                     >
                       VERTICAL STACK ({draft.stackLayers}L)
                     </text>
@@ -739,7 +739,7 @@ export const MemoryArchitectView: React.FC<MemoryArchitectViewProps> = ({
                       textAnchor="middle"
                       fill="#94A3B8"
                       fontSize="6.5"
-                      fontFamily="JetBrains Mono, monospace"
+                      fontFamily="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace"
                     >
                       BASE LOGIC / SUBSTRATE
                     </text>
@@ -793,7 +793,7 @@ export const MemoryArchitectView: React.FC<MemoryArchitectViewProps> = ({
                       y="11"
                       fill="#8C9BB2"
                       fontSize="8"
-                      fontFamily="JetBrains Mono, monospace"
+                      fontFamily="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace"
                     >
                       CELL THRESHOLD ({currentBitsMeta.states} STATES)
                     </text>
@@ -827,7 +827,7 @@ export const MemoryArchitectView: React.FC<MemoryArchitectViewProps> = ({
                       textAnchor="middle"
                       fill="#8C9BB2"
                       fontSize="6.5"
-                      fontFamily="JetBrains Mono, monospace"
+                      fontFamily="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace"
                     >
                       {currentBitsMeta.states > 16
                         ? '32 PLC LEVELS (ULTRA-TIGHT MARGIN)'

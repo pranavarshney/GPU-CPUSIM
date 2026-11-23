@@ -69,7 +69,7 @@ const TrendChartSVG: React.FC<{ data: HistoryPoint[]; metric: 'computeIndex' | '
         strokeWidth="2"
         points={pts.join(' ')}
       />
-      <text x={padX} y="12" fill="#8C9BB2" fontSize="10" fontFamily="JetBrains Mono, monospace">
+      <text x={padX} y="12" fill="#8C9BB2" fontSize="10" fontFamily="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace">
         Max: {formatCompactNumber(maxVal, 1)}
       </text>
       <text
@@ -78,7 +78,7 @@ const TrendChartSVG: React.FC<{ data: HistoryPoint[]; metric: 'computeIndex' | '
         textAnchor="end"
         fill="#8C9BB2"
         fontSize="10"
-        fontFamily="JetBrains Mono, monospace"
+        fontFamily="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace"
       >
         Y{String(data[0].year).padStart(4, '0')} – Y{String(data[data.length - 1].year).padStart(4, '0')}
       </text>

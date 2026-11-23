@@ -229,7 +229,7 @@ export const DieFloorplanSVG: React.FC<DieFloorplanSVGProps> = ({
                       textAnchor="middle"
                       fill={thermalOverlay ? '#F8FAFC' : cat.text}
                       fontSize={block.w < 18 ? '2.5' : '3.0'}
-                      fontFamily="JetBrains Mono, monospace"
+                      fontFamily="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace"
                       style={{ pointerEvents: 'none', userSelect: 'none' }}
                     >
                       {block.label}

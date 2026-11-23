@@ -20,21 +20,29 @@ const UI_SETTINGS_KEY = 'se_ui_settings_v1';
 export const MANUAL_SLOT_IDS = ['slot-1', 'slot-2', 'slot-3', 'slot-4'] as const;
 const MAX_AUTOSAVES = 4;
 
+// In-memory fallbacks used automatically if a browser restricts IndexedDB or localStorage on file:// origins
+const memorySaveStore = new Map<string, SaveRecord>();
+let memoryUiSettings: UiSettings | null = null;
+
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    if (typeof indexedDB === 'undefined') {
-      reject(new Error('IndexedDB is unavailable in this environment.'));
-      return;
-    }
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(STORE_SAVES)) {
-        db.createObjectStore(STORE_SAVES, { keyPath: 'meta.slotId' });
+    try {
+      if (typeof indexedDB === 'undefined') {
+        reject(new Error('IndexedDB is unavailable in this environment.'));
+        return;
       }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error ?? new Error('Failed to open IndexedDB.'));
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE_SAVES)) {
+          db.createObjectStore(STORE_SAVES, { keyPath: 'meta.slotId' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error ?? new Error('Failed to open IndexedDB.'));
+    } catch (err) {
+      reject(err instanceof Error ? err : new Error('IndexedDB access restricted.'));
+    }
   });
 }
 
@@ -59,24 +67,29 @@ export async function saveToSlot(
   state: GameState,
   isAutosave = false
 ): Promise<SaveSlotMetadata> {
-  const db = await openDb();
   const record: SaveRecord = {
     meta: buildMetadata(slotId, label, isAutosave, state),
     state,
   };
+  memorySaveStore.set(slotId, record);
 
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_SAVES, 'readwrite');
-    tx.objectStore(STORE_SAVES).put(record);
-    tx.oncomplete = () => {
-      db.close();
-      resolve(record.meta);
-    };
-    tx.onerror = () => {
-      db.close();
-      reject(tx.error ?? new Error('Failed to write save record.'));
-    };
-  });
+  try {
+    const db = await openDb();
+    return await new Promise<SaveSlotMetadata>((resolve, reject) => {
+      const tx = db.transaction(STORE_SAVES, 'readwrite');
+      tx.objectStore(STORE_SAVES).put(record);
+      tx.oncomplete = () => {
+        db.close();
+        resolve(record.meta);
+      };
+      tx.onerror = () => {
+        db.close();
+        reject(tx.error ?? new Error('Failed to write save record.'));
+      };
+    });
+  } catch {
+    return record.meta;
+  }
 }
 
 export async function saveQuarterlyAutosave(state: GameState): Promise<SaveSlotMetadata> {
@@ -101,53 +114,66 @@ export async function saveQuarterlyAutosave(state: GameState): Promise<SaveSlotM
 }
 
 export async function loadFromSlot(slotId: string): Promise<GameState | null> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_SAVES, 'readonly');
-    const req = tx.objectStore(STORE_SAVES).get(slotId);
-    req.onsuccess = () => {
-      db.close();
-      const rec = req.result as SaveRecord | undefined;
-      resolve(rec ? rec.state : null);
-    };
-    req.onerror = () => {
-      db.close();
-      reject(req.error ?? new Error('Failed to load save slot.'));
-    };
-  });
+  try {
+    const db = await openDb();
+    return await new Promise<GameState | null>((resolve, reject) => {
+      const tx = db.transaction(STORE_SAVES, 'readonly');
+      const req = tx.objectStore(STORE_SAVES).get(slotId);
+      req.onsuccess = () => {
+        db.close();
+        const rec = req.result as SaveRecord | undefined;
+        resolve(rec ? rec.state : (memorySaveStore.get(slotId)?.state ?? null));
+      };
+      req.onerror = () => {
+        db.close();
+        reject(req.error ?? new Error('Failed to load save slot.'));
+      };
+    });
+  } catch {
+    return memorySaveStore.get(slotId)?.state ?? null;
+  }
 }
 
 export async function deleteSaveSlot(slotId: string): Promise<void> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_SAVES, 'readwrite');
-    tx.objectStore(STORE_SAVES).delete(slotId);
-    tx.oncomplete = () => {
-      db.close();
-      resolve();
-    };
-    tx.onerror = () => {
-      db.close();
-      reject(tx.error ?? new Error('Failed to delete save slot.'));
-    };
-  });
+  memorySaveStore.delete(slotId);
+  try {
+    const db = await openDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_SAVES, 'readwrite');
+      tx.objectStore(STORE_SAVES).delete(slotId);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        reject(tx.error ?? new Error('Failed to delete save slot.'));
+      };
+    });
+  } catch {
+    // Already removed from in-memory fallback store
+  }
 }
 
 export async function listSaveSlots(): Promise<SaveSlotMetadata[]> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_SAVES, 'readonly');
-    const req = tx.objectStore(STORE_SAVES).getAll();
-    req.onsuccess = () => {
-      db.close();
-      const records = (req.result as SaveRecord[]) ?? [];
-      resolve(records.map((r) => r.meta));
-    };
-    req.onerror = () => {
-      db.close();
-      reject(req.error ?? new Error('Failed to list saves.'));
-    };
-  });
+  try {
+    const db = await openDb();
+    return await new Promise<SaveSlotMetadata[]>((resolve, reject) => {
+      const tx = db.transaction(STORE_SAVES, 'readonly');
+      const req = tx.objectStore(STORE_SAVES).getAll();
+      req.onsuccess = () => {
+        db.close();
+        const records = (req.result as SaveRecord[]) ?? [];
+        resolve(records.map((r) => r.meta));
+      };
+      req.onerror = () => {
+        db.close();
+        reject(req.error ?? new Error('Failed to list saves.'));
+      };
+    });
+  } catch {
+    return Array.from(memorySaveStore.values()).map((r) => r.meta);
+  }
 }
 
 export async function loadLatestSaveIfAny(): Promise<GameState | null> {
@@ -205,10 +231,13 @@ const DEFAULT_UI_SETTINGS: UiSettings = {
 
 export function loadUiSettings(): UiSettings {
   try {
+    if (typeof localStorage === 'undefined') {
+      return memoryUiSettings ?? DEFAULT_UI_SETTINGS;
+    }
     const raw = localStorage.getItem(UI_SETTINGS_KEY);
-    if (!raw) return DEFAULT_UI_SETTINGS;
+    if (!raw) return memoryUiSettings ?? DEFAULT_UI_SETTINGS;
     const parsed = JSON.parse(raw);
-    return {
+    const hydrated: UiSettings = {
       pauseOnMilestone:
         typeof parsed.pauseOnMilestone === 'boolean'
           ? parsed.pauseOnMilestone
@@ -222,15 +251,20 @@ export function loadUiSettings(): UiSettings {
           ? parsed.showEquationsBanner
           : DEFAULT_UI_SETTINGS.showEquationsBanner,
     };
+    memoryUiSettings = hydrated;
+    return hydrated;
   } catch {
-    return DEFAULT_UI_SETTINGS;
+    return memoryUiSettings ?? DEFAULT_UI_SETTINGS;
   }
 }
 
 export function saveUiSettings(settings: UiSettings): void {
+  memoryUiSettings = settings;
   try {
-    localStorage.setItem(UI_SETTINGS_KEY, JSON.stringify(settings));
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(UI_SETTINGS_KEY, JSON.stringify(settings));
+    }
   } catch {
-    // Ignore storage quota errors for lightweight prefs
+    // Restricted storage (e.g. strict file:// origin) — retained in memoryUiSettings
   }
 }

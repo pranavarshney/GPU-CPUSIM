@@ -108,7 +108,7 @@ const BenchmarkRadarSVG: React.FC<{
                 dominantBaseline="middle"
                 fill="#8C9BB2"
                 fontSize="8.5"
-                fontFamily="JetBrains Mono, monospace"
+                fontFamily="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace"
               >
                 {m.short}
               </text>

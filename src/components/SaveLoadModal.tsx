@@ -100,8 +100,10 @@ export const SaveLoadModal: React.FC<SaveLoadModalProps> = ({
     const a = document.createElement('a');
     a.href = url;
     a.download = `semiconductor-empire-Y${String(state.clock.year).padStart(4, '0')}.json`;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
     setStatusMsg('Exported campaign JSON file.');
   };
 
@@ -289,7 +291,7 @@ export const SaveLoadModal: React.FC<SaveLoadModalProps> = ({
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="application/json"
+                accept=".json,application/json"
                 onChange={handleImportFile}
                 className="hidden"
               />
