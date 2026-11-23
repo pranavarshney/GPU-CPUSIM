@@ -17,6 +17,7 @@ const CATEGORY_COLORS: Record<TechCategory, { accent: string; label: string }> =
   fabrication: { accent: '#06B6D4', label: 'Fabrication' },
   cpu: { accent: '#38BDF8', label: 'CPU Tech' },
   gpu: { accent: '#F59E0B', label: 'GPU Tech' },
+  memory: { accent: '#14B8A6', label: 'Memory' },
   support: { accent: '#10B981', label: 'Supporting' },
   frontier: { accent: '#D97706', label: 'Frontier' },
 };
@@ -90,7 +91,7 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
 
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center bg-[#111622] border border-[#1F2A3D] rounded-md p-0.5">
-            {(['all', 'fabrication', 'cpu', 'gpu', 'support', 'frontier'] as const).map((cat) => (
+            {(['all', 'fabrication', 'cpu', 'gpu', 'memory', 'support', 'frontier'] as const).map((cat) => (
               <button
                 key={cat}
                 type="button"
@@ -167,7 +168,7 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
               transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
               transformOrigin: '0 0',
               width: 3100,
-              height: 1080,
+              height: 1320,
               position: 'relative',
             }}
           >
@@ -177,6 +178,7 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
               { y: 312, label: 'CPU ARCHITECTURES & ISA', color: '#38BDF8' },
               { y: 552, label: 'GPU & GRAPHICS MEMORY', color: '#F59E0B' },
               { y: 792, label: 'SUPPORTING PACKAGING, RAM & COOLING', color: '#10B981' },
+              { y: 1030, label: 'MEMORY & SOLID-STATE STORAGE', color: '#14B8A6' },
             ].map((lane) => (
               <div
                 key={lane.label}
@@ -196,7 +198,7 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
             {/* SVG Dependency Curves */}
             <svg
               width={3100}
-              height={1080}
+              height={1320}
               className="absolute inset-0 pointer-events-none"
               aria-hidden="true"
             >

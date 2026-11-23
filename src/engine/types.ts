@@ -10,13 +10,16 @@ export type MainSection =
   | 'research'
   | 'cpu_architect'
   | 'gpu_architect'
+  | 'memory_architect'
   | 'manufacturing'
   | 'testing'
   | 'infrastructure'
   | 'finances'
   | 'tech_tree';
 
-export type TechCategory = 'fabrication' | 'cpu' | 'gpu' | 'support' | 'frontier';
+export type TechCategory = 'fabrication' | 'cpu' | 'gpu' | 'memory' | 'support' | 'frontier';
+
+export type MemoryCategory = 'dram' | 'vram' | 'rom_nand' | 'storage_class';
 
 export type FrontierParadigmId = 'none' | 'cryogenic' | 'photonic' | 'cnt_3d' | 'topological';
 
@@ -149,6 +152,49 @@ export interface MemoryTechSpec {
   requiredTechId?: string;
 }
 
+export interface MemoryCellArchSpec {
+  id: string;
+  name: string;
+  category: MemoryCategory;
+  /** Base array density in Gbit / mm^2 at 14 nm reference node */
+  baseGbitPerMm2: number;
+  /** Maximum bits stored per physical cell (1=SLC/1T1C, 2=MLC, 3=TLC, 4=QLC, 5=PLC) */
+  maxBitsPerCell: number;
+  /** Maximum vertical 3D stack layers (dies for HBM/3D DRAM or decks for 3D V-NAND) */
+  maxStackLayers: number;
+  /** Baseline random access latency in nanoseconds */
+  baseLatencyNs: number;
+  /** Reference per-pin transfer rate in MT/s */
+  refDataRateMTs: number;
+  /** Baseline Program/Erase endurance cycles (high sentinel for volatile / MRAM) */
+  baseEnduranceCycles: number;
+  /** Refresh current power factor (W scale; 0 for non-volatile storage) */
+  refreshPowerFactor: number;
+  /** Active array switching power factor */
+  activePowerFactor: number;
+  /** Process defect sensitivity multiplier */
+  defectMultiplier: number;
+  /** True for non-volatile storage (ROM, NAND, PCM, MRAM, Photonic SCM) */
+  nonVolatile: boolean;
+  description: string;
+  constraintNote: string;
+  requiredTechId?: string;
+}
+
+export interface MemoryInterfaceSpec {
+  id: string;
+  name: string;
+  category: MemoryCategory;
+  busWidths: number[];
+  /** Effective data transfers per clock edge/modulation (1=SDR, 2=DDR, 3=PAM3/4, etc.) */
+  signalingMultiplier: number;
+  maxDataRateMTs: number;
+  phyAreaPerSliceMm2: number;
+  phyPowerPerSliceW: number;
+  description: string;
+  requiredTechId?: string;
+}
+
 export interface IsaExtensionSpec {
   id: string;
   name: string;
@@ -256,7 +302,40 @@ export interface GpuBlueprint {
   coolingId: string;
 }
 
-export type ChipBlueprint = CpuBlueprint | GpuBlueprint;
+export interface MemoryBlueprint {
+  id: string;
+  kind: 'memory';
+  name: string;
+  revision: number;
+  status: 'draft' | 'taping_out' | 'production' | 'archived';
+  createdYear: number;
+  memoryCategory: MemoryCategory;
+  processNodeId: string;
+  transistorStructureId: string;
+  packagingId: string;
+  cellArchId: string;
+  interfaceId: string;
+  /** Target package / die capacity in GB */
+  capacityGB: number;
+  /** Vertical 3D stack tiers (1 for planar, up to 16 for HBM/3D DRAM, up to 512 for 3D NAND) */
+  stackLayers: number;
+  /** Bits per physical cell (1=SLC/1T1C, 2=MLC, 3=TLC, 4=QLC, 5=PLC) */
+  bitsPerCell: number;
+  /** Target per-pin data rate in MT/s */
+  dataRateMTs: number;
+  /** Operating supply voltage (V) */
+  voltageV: number;
+  /** Interface bus width in bits */
+  busWidthBits: number;
+  /** Independent banks / planes (4..64) */
+  bankCount: number;
+  /** On-die ECC & spare redundancy tier (0=None, 1=SECDED, 2=LDPC, 3=Deep AI-LDPC) */
+  eccLevel: number;
+  powerLimitW: number;
+  coolingId: string;
+}
+
+export type ChipBlueprint = CpuBlueprint | GpuBlueprint | MemoryBlueprint;
 
 export interface DieBlockRect {
   id: string;
@@ -271,7 +350,11 @@ export interface DieBlockRect {
     | 'io'
     | 'memory_ctrl'
     | 'rop_tmu'
-    | 'uncore';
+    | 'uncore'
+    | 'mem_array'
+    | 'sense_amp'
+    | 'ecc_ctrl'
+    | 'tsv_phy';
   x: number; // 0..100 normalized
   y: number; // 0..100 normalized
   w: number;
@@ -324,6 +407,17 @@ export interface ChipPhysicsReport {
   tapeOutRpCost?: number;
   tapeOutCreditCost: number;
   tapeOutDays: number;
+  /** Memory & Storage specific physical metrics */
+  capacityGB?: number;
+  densityGbitPerMm2?: number;
+  accessLatencyNs?: number;
+  enduranceCycles?: number;
+  enduranceTBW?: number;
+  refreshPowerW?: number;
+  sustainedDataRateMTs?: number;
+  iopsK?: number;
+  stackLayers?: number;
+  nonVolatile?: boolean;
 }
 
 export interface ChipBenchmarkReport {
@@ -337,6 +431,11 @@ export interface ChipBenchmarkReport {
   thermalPerformance: number; // 0..100 sustained thermal headroom score
   overallRating: number;
   bottlenecks: BottleneckDiagnostic[];
+  /** Optional Memory & Storage specific benchmark scores */
+  sequentialThroughput?: number;
+  randomAccessScore?: number;
+  storageDensityScore?: number;
+  enduranceReliability?: number;
 }
 
 export interface ChipEvaluation {
@@ -403,7 +502,7 @@ export interface TapeOutProject {
   id: string;
   chipId: string;
   chipName: string;
-  kind: 'cpu' | 'gpu';
+  kind: 'cpu' | 'gpu' | 'memory';
   daysCompleted: number;
   totalDays: number;
 }
@@ -429,6 +528,7 @@ export interface DepartmentBudgets {
   fabrication: number; // % share 0..100 (normalized)
   cpu: number;
   gpu: number;
+  memory: number;
   support: number;
 }
 
@@ -481,6 +581,12 @@ export interface GameState {
     powerDeficit: boolean;
     packagingStarved: boolean;
     inDebt?: boolean;
+    hasActiveCpu?: boolean;
+    hasActiveGpu?: boolean;
+    hasActiveMemory?: boolean;
+    hasActiveStorage?: boolean;
+    monthlyMemoryDiesByCategory?: Record<MemoryCategory, number>;
+    monthlyMemoryCapacityTB?: number;
   };
   unlockedTechIds: string[];
   activeResearch: ResearchProject[];
@@ -493,6 +599,7 @@ export interface GameState {
   /** Current live drafts in Architects */
   cpuDraft: CpuBlueprint;
   gpuDraft: GpuBlueprint;
+  memoryDraft: MemoryBlueprint;
   facilities: Facility[];
   productionLines: ProductionLine[];
   tapeOutQueue: TapeOutProject[];

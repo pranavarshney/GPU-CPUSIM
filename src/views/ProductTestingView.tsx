@@ -1,9 +1,16 @@
 import React, { useMemo, useState } from 'react';
 import { Archive, Copy } from 'lucide-react';
-import { getCpuArch, getGpuArch, getProcessNode } from '../engine/catalog';
+import {
+  getCpuArch,
+  getGpuArch,
+  getMemoryCellArch,
+  getProcessNode,
+  MEMORY_CATEGORY_META,
+} from '../engine/catalog';
 import { evaluateChip } from '../engine/physics';
-import { buildPreviewPhysicsContext } from '../engine/simulation';
+import { buildPreviewPhysicsContext, formatCompactNumber } from '../engine/simulation';
 import type { ChipBenchmarkReport, ChipBlueprint, GameState } from '../engine/types';
+import { formatLatencyNs, formatMemoryCapacity } from './MemoryArchitectView';
 
 interface ProductTestingViewProps {
   state: GameState;
@@ -148,8 +155,9 @@ export const ProductTestingView: React.FC<ProductTestingViewProps> = ({
     if (state.unlockedTechIds.includes('gpu_fixed_pipeline')) {
       list.push(state.gpuDraft);
     }
+    list.push(state.memoryDraft);
     return [...list, ...state.chips];
-  }, [state.cpuDraft, state.gpuDraft, state.chips, state.unlockedTechIds]);
+  }, [state.cpuDraft, state.gpuDraft, state.memoryDraft, state.chips, state.unlockedTechIds]);
 
   const [primaryId, setPrimaryId] = useState<string>(initialSelectedId ?? allTestable[0]?.id ?? 'draft_cpu');
   const [compareId, setCompareId] = useState<string>('');
@@ -168,8 +176,16 @@ export const ProductTestingView: React.FC<ProductTestingViewProps> = ({
     return evaluateChip(compareChip, ctx);
   }, [compareChip, state]);
 
-  const archLabel = (chip: ChipBlueprint) =>
-    chip.kind === 'cpu' ? getCpuArch(chip.architectureId).name : getGpuArch(chip.architectureId).name;
+  const archLabel = (chip: ChipBlueprint) => {
+    if (chip.kind === 'cpu') return getCpuArch(chip.architectureId).name;
+    if (chip.kind === 'gpu') return getGpuArch(chip.architectureId).name;
+    return `${MEMORY_CATEGORY_META[chip.memoryCategory].shortLabel} · ${getMemoryCellArch(chip.cellArchId).name}`;
+  };
+
+  const kindBadge = (chip: ChipBlueprint) =>
+    chip.kind === 'memory'
+      ? MEMORY_CATEGORY_META[chip.memoryCategory].shortLabel.toUpperCase()
+      : chip.kind.toUpperCase();
 
   return (
     <div className="p-6 max-w-[1440px] mx-auto space-y-6">
@@ -193,7 +209,7 @@ export const ProductTestingView: React.FC<ProductTestingViewProps> = ({
             >
               {allTestable.map((c) => (
                 <option key={c.id} value={c.id}>
-                  [{c.kind.toUpperCase()} · {c.status === 'draft' ? 'DRAFT' : c.status.toUpperCase()}] {c.name}
+                  [{kindBadge(c)} · {c.status === 'draft' ? 'DRAFT' : c.status.toUpperCase()}] {c.name}
                 </option>
               ))}
             </select>
@@ -211,7 +227,7 @@ export const ProductTestingView: React.FC<ProductTestingViewProps> = ({
                 .filter((c) => c.id !== primaryChip.id)
                 .map((c) => (
                   <option key={c.id} value={c.id}>
-                    [{c.kind.toUpperCase()}] {c.name}
+                    [{kindBadge(c)}] {c.name}
                   </option>
                 ))}
             </select>
@@ -228,7 +244,7 @@ export const ProductTestingView: React.FC<ProductTestingViewProps> = ({
               <div>
                 <h2 className="text-base font-semibold text-[#E8EEF7]">{primaryChip.name}</h2>
                 <p className="text-xs text-[#8C9BB2]">
-                  {primaryChip.kind.toUpperCase()} · {getProcessNode(primaryChip.processNodeId).name} ·{' '}
+                  {kindBadge(primaryChip)} · {getProcessNode(primaryChip.processNodeId).name} ·{' '}
                   {archLabel(primaryChip)}
                 </p>
               </div>
@@ -298,6 +314,54 @@ export const ProductTestingView: React.FC<ProductTestingViewProps> = ({
                 );
               })}
             </div>
+
+            {/* Dedicated Memory & Storage Validation Scores */}
+            {primaryChip.kind === 'memory' && (
+              <div className="pt-4 border-t border-[#1F2A3D] space-y-2.5">
+                <div className="text-xs font-semibold text-[#14B8A6]">
+                  Memory &amp; Storage Subsystem Benchmarks
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono tabular-nums">
+                  {[
+                    {
+                      label: 'Seq Throughput',
+                      val: primaryEval.benchmarks.sequentialThroughput ?? 0,
+                      cmp: compareEval?.benchmarks.sequentialThroughput,
+                    },
+                    {
+                      label: 'Random Access',
+                      val: primaryEval.benchmarks.randomAccessScore ?? 0,
+                      cmp: compareEval?.benchmarks.randomAccessScore,
+                    },
+                    {
+                      label: 'Storage Density',
+                      val: primaryEval.benchmarks.storageDensityScore ?? 0,
+                      cmp: compareEval?.benchmarks.storageDensityScore,
+                    },
+                    {
+                      label: 'Endurance & ECC',
+                      val: primaryEval.benchmarks.enduranceReliability ?? 0,
+                      cmp: compareEval?.benchmarks.enduranceReliability,
+                    },
+                  ].map((item) => (
+                    <div
+                      key={item.label}
+                      className="p-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] space-y-0.5"
+                    >
+                      <div className="text-[11px] font-sans text-[#8C9BB2]">{item.label}</div>
+                      <div className="text-sm font-semibold text-[#E8EEF7]">
+                        {item.val.toLocaleString()}
+                      </div>
+                      {item.cmp !== undefined && (
+                        <div className="text-[10px] text-[#FBBF24]">
+                          vs {item.cmp.toLocaleString()}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Plain-English Bottleneck Diagnostics */}
@@ -356,7 +420,43 @@ export const ProductTestingView: React.FC<ProductTestingViewProps> = ({
               {[
                 ['Transistor Count', `${primaryEval.physics.transistorCountMTr.toFixed(2)} MTr`],
                 ['Die Area / Reticle', `${primaryEval.physics.dieAreaMm2.toFixed(1)} / ${primaryEval.physics.reticleLimitMm2.toFixed(0)} mm²`],
-                ['Sustained Clock', primaryEval.physics.sustainedClockGHz < 1 ? `${Math.round(primaryEval.physics.sustainedClockGHz * 1000)} MHz` : `${primaryEval.physics.sustainedClockGHz.toFixed(2)} GHz`],
+                ...(primaryEval.physics.capacityGB !== undefined
+                  ? [
+                      [
+                        'Capacity & Stack Layers',
+                        `${formatMemoryCapacity(primaryEval.physics.capacityGB)} (${primaryEval.physics.stackLayers ?? 1}L)`,
+                      ],
+                      [
+                        'Areal Density',
+                        `${(primaryEval.physics.densityGbitPerMm2 ?? 0).toFixed(3)} Gbit/mm²`,
+                      ],
+                      [
+                        'Sustained Data Rate',
+                        `${Math.round(primaryEval.physics.sustainedDataRateMTs ?? 0).toLocaleString()} MT/s`,
+                      ],
+                      [
+                        'Access Latency',
+                        formatLatencyNs(primaryEval.physics.accessLatencyNs ?? 0),
+                      ],
+                      [
+                        'Random IOPS',
+                        `${formatCompactNumber((primaryEval.physics.iopsK ?? 0) * 1000, 1)} IOPS`,
+                      ],
+                      [
+                        'Endurance / Refresh',
+                        primaryEval.physics.nonVolatile
+                          ? `${formatCompactNumber(primaryEval.physics.enduranceTBW ?? 0, 1)} TBW (${formatCompactNumber(primaryEval.physics.enduranceCycles ?? 0, 1)} P/E)`
+                          : `Volatile · ${(primaryEval.physics.refreshPowerW ?? 0).toFixed(2)} W refresh`,
+                      ],
+                    ]
+                  : [
+                      [
+                        'Sustained Clock',
+                        primaryEval.physics.sustainedClockGHz < 1
+                          ? `${Math.round(primaryEval.physics.sustainedClockGHz * 1000)} MHz`
+                          : `${primaryEval.physics.sustainedClockGHz.toFixed(2)} GHz`,
+                      ],
+                    ]),
                 ...(primaryEval.physics.effectiveIpc !== undefined
                   ? [['Effective IPC', `${primaryEval.physics.effectiveIpc.toFixed(2)} IPC`]]
                   : []),

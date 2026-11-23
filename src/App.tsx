@@ -12,6 +12,7 @@ import {
   assignProductionLine,
   cancelResearchProject,
   createInitialState,
+  migrateGameState,
   queueFacilityBuild,
   queueFacilityUpgrade,
   recomputeTelemetry,
@@ -35,6 +36,7 @@ import type {
   GameState,
   GpuBlueprint,
   MainSection,
+  MemoryBlueprint,
   SimulationSpeed,
   UiSettings,
 } from './engine/types';
@@ -43,6 +45,7 @@ import { FinancesView } from './views/FinancesView';
 import { GpuArchitectView } from './views/GpuArchitectView';
 import { InfrastructureView } from './views/InfrastructureView';
 import { ManufacturingView } from './views/ManufacturingView';
+import { MemoryArchitectView } from './views/MemoryArchitectView';
 import { OverviewView } from './views/OverviewView';
 import { ProductTestingView } from './views/ProductTestingView';
 import { ResearchView } from './views/ResearchView';
@@ -77,7 +80,10 @@ export default function App() {
     loadLatestSaveIfAny().then((loaded) => {
       if (active && loaded) {
         cacheRef.current.clear();
-        const refreshed = recomputeTelemetry({ ...loaded, speed: 0 }, cacheRef.current);
+        const refreshed = recomputeTelemetry(
+          migrateGameState({ ...loaded, speed: 0 }),
+          cacheRef.current
+        );
         setState(refreshed);
         setAutosaveNotice('Restored last session (Paused)');
         setTimeout(() => setAutosaveNotice(null), 4000);
@@ -223,6 +229,10 @@ export default function App() {
     setState((prev) => ({ ...prev, gpuDraft: next }));
   }, []);
 
+  const handleUpdateMemoryDraft = useCallback((next: MemoryBlueprint) => {
+    setState((prev) => ({ ...prev, memoryDraft: next }));
+  }, []);
+
   const handleStartTapeOut = useCallback(
     (draft: ChipBlueprint): { error?: string } => {
       let errorOut: string | undefined;
@@ -291,7 +301,7 @@ export default function App() {
         },
       }));
       setActiveSection('cpu_architect');
-    } else {
+    } else if (chip.kind === 'gpu') {
       setState((prev) => ({
         ...prev,
         gpuDraft: {
@@ -303,12 +313,24 @@ export default function App() {
         },
       }));
       setActiveSection('gpu_architect');
+    } else {
+      setState((prev) => ({
+        ...prev,
+        memoryDraft: {
+          ...chip,
+          id: 'draft_memory',
+          status: 'draft',
+          name: `${chip.name} Rev 2`,
+          revision: prev.memoryDraft.revision + 1,
+        },
+      }));
+      setActiveSection('memory_architect');
     }
   }, []);
 
   const handleLoadSavedState = useCallback((loaded: GameState, notice: string) => {
     cacheRef.current.clear();
-    setState(recomputeTelemetry({ ...loaded, speed: 0 }, cacheRef.current));
+    setState(recomputeTelemetry(migrateGameState({ ...loaded, speed: 0 }), cacheRef.current));
     setAutosaveNotice(notice);
     setTimeout(() => setAutosaveNotice(null), 4000);
   }, []);
@@ -399,6 +421,30 @@ export default function App() {
                 handleStartResearch('gpu_fixed_pipeline');
                 setActiveSection('research');
               }}
+            />
+          )}
+
+          {activeSection === 'memory_architect' && (
+            <MemoryArchitectView
+              state={state}
+              thermalOverlay={uiSettings.thermalOverlayDefault}
+              onToggleThermal={() =>
+                setUiSettings((s) => ({
+                  ...s,
+                  thermalOverlayDefault: !s.thermalOverlayDefault,
+                }))
+              }
+              onUpdateDraft={handleUpdateMemoryDraft}
+              onStartTapeOut={handleStartTapeOut}
+              onTestPrototype={() => {
+                setTestingSelectedId('draft_memory');
+                setActiveSection('testing');
+              }}
+              onStartResearch={(techId) => {
+                handleStartResearch(techId);
+                setActiveSection('research');
+              }}
+              onJumpToTechTree={() => setActiveSection('tech_tree')}
             />
           )}
 

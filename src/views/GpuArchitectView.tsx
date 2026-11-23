@@ -19,6 +19,7 @@ import {
   clampToSlider,
   evaluateGpuPhysics,
   getGpuSliderBounds,
+  getStabilizedVoltageV,
   GPU_BUS_WIDTHS,
 } from '../engine/physics';
 import { buildPreviewPhysicsContext, formatCompactNumber } from '../engine/simulation';
@@ -367,17 +368,37 @@ export const GpuArchitectView: React.FC<GpuArchitectViewProps> = ({
               </div>
 
               <div className="space-y-1.5 sm:col-span-2">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className="text-[#8C9BB2] truncate">
                     GPU Voltage (Vmin {physics.minStableVoltageV.toFixed(2)} V)
                   </span>
-                  <span
-                    className={`font-mono tabular-nums ${
-                      physics.voltageUnstable ? 'text-rose-400 font-semibold' : 'text-[#E8EEF7]'
-                    }`}
-                  >
-                    {draft.voltageV.toFixed(2)} V
-                  </span>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        patch({
+                          voltageV: getStabilizedVoltageV(
+                            physics.minStableVoltageV,
+                            sliderBounds.voltageV
+                          ),
+                        })
+                      }
+                      className={`h-5 px-2 rounded text-[11px] font-medium border transition-colors whitespace-nowrap cursor-pointer ${
+                        physics.voltageUnstable
+                          ? 'bg-rose-500/20 border-rose-400/60 text-rose-200 hover:bg-rose-500/30'
+                          : 'bg-[#0B0F17] border-[#2C3B55] text-[#22D3EE] hover:bg-[#171E2E]'
+                      }`}
+                    >
+                      Auto-Stabilize
+                    </button>
+                    <span
+                      className={`font-mono tabular-nums ${
+                        physics.voltageUnstable ? 'text-rose-400 font-semibold' : 'text-[#E8EEF7]'
+                      }`}
+                    >
+                      {draft.voltageV.toFixed(2)} V
+                    </span>
+                  </div>
                 </div>
                 <input
                   type="range"

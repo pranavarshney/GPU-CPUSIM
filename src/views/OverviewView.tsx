@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowRight, Cpu, FlaskConical, Factory, GitBranch } from 'lucide-react';
+import { ArrowRight, Cpu, FlaskConical, Factory, GitBranch, HardDrive } from 'lucide-react';
 import { getBestLithography, getMaxWaferDiameterMm, getTechNode } from '../engine/catalog';
 import { formatCompactNumber, formatSimDate } from '../engine/simulation';
 import type { GameState, HistoryPoint, MainSection } from '../engine/types';
@@ -121,6 +121,14 @@ export const OverviewView: React.FC<OverviewViewProps> = ({ state, onNavigate })
           >
             <Cpu className="w-3.5 h-3.5 text-[#06B6D4]" />
             <span>Design CPU</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onNavigate('memory_architect')}
+            className="h-9 px-3.5 rounded-md bg-[#111622] hover:bg-[#171E2E] text-[#E8EEF7] border border-[#2C3B55] text-xs font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer"
+          >
+            <HardDrive className="w-3.5 h-3.5 text-[#14B8A6]" />
+            <span>Design Memory</span>
           </button>
         </div>
       </div>
@@ -442,6 +450,85 @@ export const OverviewView: React.FC<OverviewViewProps> = ({ state, onNavigate })
                   />
                 </div>
               </div>
+            </div>
+          </div>
+
+          {/* Silicon Division Product Mix & Full-Stack Ecosystem Synergy */}
+          <div className="bg-[#111622] border border-[#1F2A3D] rounded-lg p-5 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-sm font-semibold text-[#E8EEF7]">
+                Full-Stack Silicon Ecosystem
+              </h2>
+              <span className="text-xs font-mono tabular-nums text-[#22D3EE]">
+                {state.telemetry.activeChipEcosystemBonus.toFixed(2)}× / 1.68×
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              {[
+                {
+                  label: 'Compute CPUs',
+                  active: state.telemetry.hasActiveCpu,
+                  bonus: 'Core Demand',
+                  section: 'cpu_architect' as MainSection,
+                },
+                {
+                  label: 'Graphics GPUs',
+                  active: state.telemetry.hasActiveGpu,
+                  bonus: '+0.32× w/ CPU',
+                  section: 'gpu_architect' as MainSection,
+                },
+                {
+                  label: 'System RAM / VRAM',
+                  active: state.telemetry.hasActiveMemory,
+                  bonus: '+0.18× Synergy',
+                  section: 'memory_architect' as MainSection,
+                },
+                {
+                  label: 'Solid-State Storage',
+                  active: state.telemetry.hasActiveStorage,
+                  bonus: '+0.18× Synergy',
+                  section: 'memory_architect' as MainSection,
+                },
+              ].map((div) => (
+                <button
+                  key={div.label}
+                  type="button"
+                  onClick={() => onNavigate(div.section)}
+                  className={`p-2.5 rounded-md border text-left transition-colors cursor-pointer ${
+                    div.active
+                      ? 'bg-[#0E2430]/60 border-[#14B8A6]/50'
+                      : 'bg-[#0B0F17] border-[#1F2A3D] hover:border-[#2C3B55]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="font-medium text-[#E8EEF7] truncate">{div.label}</span>
+                    <span
+                      className={`font-mono text-[10px] shrink-0 ${
+                        div.active ? 'text-emerald-400' : 'text-[#64748B]'
+                      }`}
+                    >
+                      {div.active ? 'SHIPPING' : 'IDLE'}
+                    </span>
+                  </div>
+                  <div className="text-[11px] font-mono tabular-nums text-[#8C9BB2] mt-0.5">
+                    {div.bonus}
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-between text-xs pt-2 border-t border-[#1F2A3D] font-mono tabular-nums">
+              <span className="text-[#8C9BB2] font-sans">Memory &amp; Storage Shipped</span>
+              <span className="text-[#14B8A6] font-semibold">
+                {(() => {
+                  const memTB = state.telemetry.monthlyMemoryCapacityTB ?? 0;
+                  if (memTB >= 100) return `${formatCompactNumber(memTB, 1)} TB/mo`;
+                  if (memTB >= 1) return `${memTB.toFixed(2)} TB/mo`;
+                  if (memTB > 0) return `${(memTB * 1024).toFixed(1)} GB/mo`;
+                  return '0.0 GB/mo';
+                })()}
+              </span>
             </div>
           </div>
 

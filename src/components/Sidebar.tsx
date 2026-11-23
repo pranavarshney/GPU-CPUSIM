@@ -7,6 +7,7 @@ import {
   FlaskConical,
   Gauge,
   GitBranch,
+  HardDrive,
   Landmark,
   Layers,
   Microchip,
@@ -37,6 +38,7 @@ const NAV_ITEMS: NavItem[] = [
   },
   { id: 'cpu_architect', label: 'CPU Architect', icon: Cpu },
   { id: 'gpu_architect', label: 'GPU Architect', icon: Microchip },
+  { id: 'memory_architect', label: 'Memory & Storage', icon: HardDrive },
   {
     id: 'manufacturing',
     label: 'Manufacturing',

@@ -13,20 +13,30 @@
  *    - GPU: N_tr = [ S_cores * T_shader + N_ROP * T_ROP + N_TMU * T_TMU ]
  *                  + [ 6.4 * (L1_MB + L2_MB) ]
  *                  + [ T_PHY(busBits) ]
+ *    - MEMORY / STORAGE:
+ *                  Bit cells (capacitors, floating gates, MTJs, PCM) are passive storage
+ *                  elements scaled by vertical 3D stack tiers and multi-bit encoding (SLC..PLC),
+ *                  while CMOS periphery logic comprises Sense Amps + ECC Controller + I/O PHY.
  *
  * 2. DIE AREA (mm^2):
  *    A = ( N_logic / (delta_logic * eta_trans * frontierDensity)
  *        + N_cache / (delta_SRAM  * sqrt(eta_trans) * frontierDensity) )
  *        * (1 + gamma_routing(cores)) + A_IO_pads
  *    Note: SRAM scales slower than logic below 5nm (embedded in node.sramDensityMTrPerMm2).
+ *    Memory Array Effective Density (Gbit/mm^2):
+ *      rho_eff = rho_base * (delta_SRAM / 44)^0.72 * sqrt(eta_trans) * frontierDensity
+ *                * layers^alpha_stack * bitsPerCell / (1 + eccAreaOverhead)
+ *      where alpha_stack = 0.91 (3D V-NAND) or 0.94 (HBM / 3D DRAM / SCM).
  *
- * 3. VOLTAGE-FREQUENCY WALL & POWER (GHz, V, W):
- *    Unified across CPU & GPU:
- *    V_min(f) = V_nom * (0.72 + 0.28 * (f / f_ref_eff)^1.85)
+ * 3. VOLTAGE-FREQUENCY WALL & POWER (GHz / MT/s, V, W):
+ *    Unified across CPU, GPU, and Memory:
+ *    V_min(f) = V_nom * (0.72 + 0.28 * (f / f_ref_eff)^1.85) * (1 + 0.035*(bitsPerCell - 1))
  *      where CPU f_ref_eff = f_ref * archClockEff * transClockMult
  *      and   GPU f_ref_eff = f_ref * 0.72 * archClockEff * transClockMult
+ *      and   MEM r_ref_eff = min(iface.maxRate, cellArch.refRate * (f_ref/4.3)^0.55 * transClockMult)
  *    P_dyn    = alpha * C_eff * V^2 * f_eff  (scales with clock ratio as P_dyn ∝ f^2.2)
  *    P_leak   = k_leak * eta_leak * N_tr * V * exp((T_j - 25) / 42)
+ *               (+ temperature-coupled DRAM/VRAM capacitor refresh power P_refresh(T_j))
  *    P_tunnel = tunnelFloor * (1 - trans.tunnelingMitigation) * N_tr
  *    P_raw    = P_dyn + P_leak + P_tunnel
  *    If P_dyn + P_leak + P_tunnel > powerLimitW inside the thermal loop, f_eff rolls back via P_dyn ∝ f^2.2.
@@ -35,7 +45,8 @@
  *    Solved via 5-step fixed-point iteration coupling T_j <-> P_leak(T_j) <-> powerLimitW:
  *    heatFlux q = P_eff / max(A, 1)  [W/mm^2]
  *    R_hotspot  = 0.12 * q^0.6 * frontierFluxPenalty  [C/W]
- *    T_j = T_amb + P_eff * (max(0.032, (R_cool - R_pkgOffset) * frontierThermal) + R_hotspot)
+ *    R_stack    = 0.06 * log2(layers) [HBM/3D DRAM] or 0.025 * log2(layers) [3D V-NAND]
+ *    T_j = T_amb + P_eff * (max(0.032, (R_cool - R_pkgOffset) * frontierThermal) + R_stack + R_hotspot)
  *    If T_j > T_throttle:
  *       Iteratively solves thermalRatio (up to 6 passes, floor 0.22) scaling P_dyn ∝ ratio^2.2
  *       and recomputing P_leak(T_j), q, and T_j until T_j <= T_throttle or the 0.22 floor is hit.
@@ -46,6 +57,7 @@
  *    A_scribe = (sqrt(A) + 0.2)^2  [mm^2], edge exclusion e = 3 mm
  *    N_gross  = floor( pi*(D_w/2 - e)^2 / A_scribe - pi*(D_w - 2e) / sqrt(2 * A_scribe) )
  *    D_eff    = D_base * M_litho * M_trans * M_pkg * M_cleanroom * M_maturation * M_frontier
+ *               (* M_cell * M_stack * M_bits * (1 - eccRescue) for memory arrays)
  *               where M_maturation = 0.45 + 0.55 * exp(-0.08 * maturationXP)
  *    Y        = ((1 - exp(-A_cm2 * D_eff)) / (A_cm2 * D_eff))^2 * eta_QA
  *
@@ -59,6 +71,9 @@
  *      VRAM Bandwidth (BusWidth/8 * DataRate * Compression) aided by L1 + L2 cache relief
  *      (1 + 0.14*ln(1 + L2_MB/2) + 0.04*ln(1 + L1_MB/0.016)). VRAM capacity does NOT boost
  *      speed linearly; it governs a Workload Footprint Cap penalty only when undersized.
+ *    - Memory & Storage balances Sequential Bandwidth ((BusWidth/8) * sustainedMT/s),
+ *      Random Access Latency/IOPS (bank parallelism vs. multi-bit voltage sensing & ECC overhead),
+ *      Areal Bit Density (Gbit/mm^2), and Program/Erase Endurance TBW (SLC..PLC vs. LDPC ECC).
  *
  * LIMITATIONS:
  *    - Steady-state DC thermal equilibrium (no transient ms turbo thermal capacitance).
@@ -73,12 +88,18 @@ import {
   getGpuArch,
   getMaxPcieGen,
   getMaxWaferDiameterMm,
+  getMemoryCellArch,
+  getMemoryInterface,
   getMemoryTech,
   getPackagingSpec,
   getPcieBandwidthPerLaneGBs,
   getProcessNode,
   getTransistorStructure,
+  getUnlockedMemoryCellArchs,
+  getUnlockedMemoryInterfaces,
   ISA_EXTENSIONS,
+  MEMORY_CELL_ARCHS,
+  MEMORY_INTERFACES,
 } from './catalog';
 import type {
   BottleneckDiagnostic,
@@ -89,6 +110,8 @@ import type {
   CpuBlueprint,
   DieBlockRect,
   GpuBlueprint,
+  MemoryBlueprint,
+  MemoryCategory,
 } from './types';
 
 // ─── DOCUMENTED PHYSICS & UI TUNING CONSTANTS ───────────────────────────────
@@ -126,6 +149,25 @@ export const THERMAL_SOLVER_ITERATIONS = 5;
 export const THERMAL_THROTTLE_MAX_ITERATIONS = 6;
 /** Valid GPU memory bus widths (bits). */
 export const GPU_BUS_WIDTHS = [64, 128, 192, 256, 384, 512, 1024, 2048, 4096] as const;
+/** Max slider data-rate ratio above effective memory reference rate. */
+export const MEMORY_MAX_RATE_RATIO_CAP = 1.48;
+/** Valid Memory bank / plane counts. */
+export const MEMORY_BANK_COUNTS = [4, 8, 16, 32, 64] as const;
+/** Multi-bit cell naming & physical trade-offs (1=SLC/1T1C .. 5=PLC). */
+export const BITS_PER_CELL_META = [
+  { bits: 1, shortLabel: 'SLC / 1-bit', states: 2, enduranceMult: 1.0, latencyMult: 1.0 },
+  { bits: 2, shortLabel: 'MLC (2-bit)', states: 4, enduranceMult: 0.32, latencyMult: 1.45 },
+  { bits: 3, shortLabel: 'TLC (3-bit)', states: 8, enduranceMult: 0.08, latencyMult: 2.1 },
+  { bits: 4, shortLabel: 'QLC (4-bit)', states: 16, enduranceMult: 0.02, latencyMult: 3.1 },
+  { bits: 5, shortLabel: 'PLC (5-bit)', states: 32, enduranceMult: 0.005, latencyMult: 4.4 },
+] as const;
+/** On-die ECC & spare redundancy tiers. */
+export const ECC_LEVEL_META = [
+  { level: 0, label: 'None', areaOverhead: 0.0, defectMitigation: 0.0, enduranceMult: 1.0, latencyMult: 1.0 },
+  { level: 1, label: 'SECDED', areaOverhead: 0.06, defectMitigation: 0.16, enduranceMult: 1.35, latencyMult: 1.04 },
+  { level: 2, label: 'LDPC', areaOverhead: 0.14, defectMitigation: 0.3, enduranceMult: 2.1, latencyMult: 1.1 },
+  { level: 3, label: 'Deep AI-LDPC', areaOverhead: 0.24, defectMitigation: 0.42, enduranceMult: 3.4, latencyMult: 1.18 },
+] as const;
 
 export interface SliderRange {
   min: number;
@@ -181,6 +223,12 @@ export const PHYSICS_DOCUMENTATION: PhysicsDocEntry[] = [
     assumptions: 'CPU PCIe bandwidth (lanes × gen GB/s) feeds General Compute & Gaming with diminishing returns. GPU VRAM capacity enforces footprint sufficiency.',
   },
   {
+    title: 'Memory & Solid-State 3D Array Physics',
+    equation: 'ρ_eff = ρ_base · (δ_SRAM/44)^0.72 · √η_trans · L^α · b / (1 + ε_ECC)  |  BW = (Bus/8) · MT/s_eff',
+    units: 'Gbit/mm², GB/s, ns, TBW',
+    assumptions: '3D stacks compound defect & TSV thermal resistance (0.06·log₂L °C/W). Multi-bit cells (SLC→PLC) scale density linearly while cutting P/E endurance exponentially unless shielded by LDPC ECC.',
+  },
+  {
     title: 'Constrained Frontier Synthesis',
     equation: 'Cost(L) = RP_0 · r^L  |  Gain(L) = c · ln(1 + k · L)',
     units: 'RP, dimensionless multiplier',
@@ -199,6 +247,17 @@ export function clampToSlider(value: number, range: SliderRange): number {
   const clamped = Math.max(range.min, Math.min(range.max, value));
   const steps = Math.round((clamped - range.min) / range.step);
   const snapped = Math.max(range.min, Math.min(range.max, range.min + steps * range.step));
+  return roundToPrecision(snapped, range.step);
+}
+
+/**
+ * Computes the lowest voltage aligned to the voltage slider grid that clears Vmin
+ * with a clean +1 step stability margin, clamped safely within [range.min, range.max].
+ */
+export function getStabilizedVoltageV(minStableVoltageV: number, range: SliderRange): number {
+  const target = Math.max(range.min, minStableVoltageV + VOLTAGE_SLIDER_STEP);
+  const steps = Math.ceil((target - range.min - 1e-9) / range.step);
+  const snapped = Math.min(range.max, Math.max(range.min, range.min + Math.max(0, steps) * range.step));
   return roundToPrecision(snapped, range.step);
 }
 
@@ -519,6 +578,361 @@ export function applyGpuVramChange(draft: GpuBlueprint, vramTechId: string): Gpu
   };
 }
 
+// ─── MEMORY & STORAGE BOUNDS & TRANSITION HELPERS ───────────────────────────
+
+export function getEffectiveRefMemoryDataRateMTs(
+  nodeId: string,
+  cellArchId: string,
+  interfaceId: string,
+  transId: string
+): number {
+  const node = getProcessNode(nodeId);
+  const cellArch = getMemoryCellArch(cellArchId);
+  const iface = getMemoryInterface(interfaceId);
+  const trans = getTransistorStructure(transId);
+  const nodeRateScale = Math.min(1.65, Math.max(0.15, Math.pow(node.refClockGHz / 4.3, 0.55)));
+  const rawRef = cellArch.refDataRateMTs * nodeRateScale * trans.clockMultiplier;
+  return Math.max(10, Math.min(iface.maxDataRateMTs, rawRef));
+}
+
+export function getMemoryDataRateStepForMax(maxRateMTs: number): number {
+  if (maxRateMTs <= 100) return 2;
+  if (maxRateMTs <= 800) return 10;
+  if (maxRateMTs <= 4000) return 50;
+  if (maxRateMTs <= 16000) return 100;
+  return 250;
+}
+
+export function getMaxMemoryDataRateMTs(
+  nodeId: string,
+  cellArchId: string,
+  interfaceId: string,
+  transId: string
+): number {
+  const iface = getMemoryInterface(interfaceId);
+  const effRef = getEffectiveRefMemoryDataRateMTs(nodeId, cellArchId, interfaceId, transId);
+  const rawMax = Math.min(iface.maxDataRateMTs, effRef * MEMORY_MAX_RATE_RATIO_CAP);
+  const step = getMemoryDataRateStepForMax(rawMax);
+  const snapped = Math.floor((rawMax + 1e-9) / step) * step;
+  return Math.max(step, roundToPrecision(snapped, step));
+}
+
+export function getMinMemoryDataRateMTs(
+  nodeId: string,
+  cellArchId: string,
+  interfaceId: string,
+  transId: string
+): number {
+  const maxRate = getMaxMemoryDataRateMTs(nodeId, cellArchId, interfaceId, transId);
+  const step = getMemoryDataRateStepForMax(maxRate);
+  const effRef = getEffectiveRefMemoryDataRateMTs(nodeId, cellArchId, interfaceId, transId);
+  const rawMin = Math.max(step, effRef * 0.35);
+  const snapped = Math.round(rawMin / step) * step;
+  return Math.min(maxRate, Math.max(step, roundToPrecision(snapped, step)));
+}
+
+export function computeMinStableMemoryVoltageV(
+  nodeId: string,
+  cellArchId: string,
+  interfaceId: string,
+  transId: string,
+  dataRateMTs: number,
+  bitsPerCell: number
+): number {
+  const node = getProcessNode(nodeId);
+  const effRef = getEffectiveRefMemoryDataRateMTs(nodeId, cellArchId, interfaceId, transId);
+  const rateRatio = dataRateMTs / Math.max(10, effRef);
+  const multiBitMargin = 1 + Math.max(0, bitsPerCell - 1) * 0.035;
+  return Number(
+    (
+      node.nominalVoltageV *
+      (V_MIN_BASE + V_MIN_SLOPE * Math.pow(Math.max(0.1, rateRatio), V_MIN_EXPONENT)) *
+      multiBitMargin
+    ).toFixed(3)
+  );
+}
+
+export function getMaxMemoryVoltageForConfig(
+  nodeId: string,
+  cellArchId: string,
+  interfaceId: string,
+  transId: string,
+  bitsPerCell: number
+): number {
+  const node = getProcessNode(nodeId);
+  const maxRate = getMaxMemoryDataRateMTs(nodeId, cellArchId, interfaceId, transId);
+  const vMinAtMax = computeMinStableMemoryVoltageV(
+    nodeId,
+    cellArchId,
+    interfaceId,
+    transId,
+    maxRate,
+    bitsPerCell
+  );
+  const baseMax = Math.max(1.8, node.nominalVoltageV * VOLTAGE_MAX_MULTIPLIER);
+  const required = Math.max(baseMax, vMinAtMax + VOLTAGE_SLIDER_STEP);
+  const steps = Math.ceil((required - VOLTAGE_SLIDER_MIN - 1e-9) / VOLTAGE_SLIDER_STEP);
+  return Number((VOLTAGE_SLIDER_MIN + Math.max(1, steps) * VOLTAGE_SLIDER_STEP).toFixed(2));
+}
+
+export function getAllowedStackLayersForArch(cellArchId: string): number[] {
+  const cellArch = getMemoryCellArch(cellArchId);
+  const maxL = cellArch.maxStackLayers;
+  if (maxL <= 1) return [1];
+  const candidates = [1, 2, 4, 8, 12, 16, 32, 64, 96, 128, 176, 232, 256, 384, 512];
+  const filtered = candidates.filter((v) => v <= maxL);
+  if (!filtered.includes(maxL)) filtered.push(maxL);
+  return filtered;
+}
+
+export function getMemoryCapacityRange(
+  nodeId: string,
+  cellArchId: string,
+  transId: string,
+  stackLayers: number,
+  bitsPerCell: number
+): SliderRange {
+  const node = getProcessNode(nodeId);
+  const cellArch = getMemoryCellArch(cellArchId);
+  const trans = getTransistorStructure(transId);
+
+  const nodeDensityScale =
+    Math.pow(node.sramDensityMTrPerMm2 / 44, 0.72) * Math.sqrt(trans.densityMultiplier);
+  const layerAlpha = cellArch.category === 'rom_nand' ? 0.91 : 0.94;
+  const effectiveLayerGain = Math.pow(Math.max(1, stackLayers), layerAlpha);
+  const nomGbitPerMm2 =
+    cellArch.baseGbitPerMm2 * nodeDensityScale * effectiveLayerGain * Math.max(1, bitsPerCell);
+  const maxReasonableGB = (nomGbitPerMm2 * 420) / 8;
+
+  if (maxReasonableGB < 0.02) return { min: 0.001, max: 0.032, step: 0.001 };
+  if (maxReasonableGB < 0.12) return { min: 0.004, max: 0.128, step: 0.004 };
+  if (maxReasonableGB < 0.5) return { min: 0.016, max: 0.512, step: 0.016 };
+  if (maxReasonableGB < 2.0) return { min: 0.064, max: 2, step: 0.064 };
+  if (maxReasonableGB < 8.0) return { min: 0.25, max: 16, step: 0.25 };
+  if (maxReasonableGB < 32) return { min: 1, max: 64, step: 1 };
+  if (maxReasonableGB < 128) return { min: 4, max: 256, step: 4 };
+  if (maxReasonableGB < 512) return { min: 16, max: 1024, step: 16 };
+  if (maxReasonableGB < 2048) return { min: 64, max: 4096, step: 64 };
+  return { min: 256, max: 16384, step: 256 };
+}
+
+export function getMemorySliderBounds(
+  draft: Pick<
+    MemoryBlueprint,
+    | 'processNodeId'
+    | 'cellArchId'
+    | 'interfaceId'
+    | 'transistorStructureId'
+    | 'stackLayers'
+    | 'bitsPerCell'
+  >
+): {
+  capacityGB: SliderRange;
+  stackLayersOptions: number[];
+  bitsPerCell: SliderRange;
+  dataRateMTs: SliderRange;
+  voltageV: SliderRange;
+  busWidthOptions: number[];
+  bankCountOptions: readonly number[];
+  eccLevel: SliderRange;
+  powerLimitW: SliderRange;
+} {
+  const cellArch = getMemoryCellArch(draft.cellArchId);
+  const iface = getMemoryInterface(draft.interfaceId);
+  const clampedBits = Math.max(1, Math.min(cellArch.maxBitsPerCell, draft.bitsPerCell));
+  const stackLayersOptions = getAllowedStackLayersForArch(draft.cellArchId);
+  const clampedLayers = stackLayersOptions.includes(draft.stackLayers)
+    ? draft.stackLayers
+    : stackLayersOptions[stackLayersOptions.length - 1] ?? 1;
+
+  const rateMax = getMaxMemoryDataRateMTs(
+    draft.processNodeId,
+    draft.cellArchId,
+    draft.interfaceId,
+    draft.transistorStructureId
+  );
+  const rateStep = getMemoryDataRateStepForMax(rateMax);
+  const rateMin = getMinMemoryDataRateMTs(
+    draft.processNodeId,
+    draft.cellArchId,
+    draft.interfaceId,
+    draft.transistorStructureId
+  );
+
+  return {
+    capacityGB: getMemoryCapacityRange(
+      draft.processNodeId,
+      draft.cellArchId,
+      draft.transistorStructureId,
+      clampedLayers,
+      clampedBits
+    ),
+    stackLayersOptions,
+    bitsPerCell: { min: 1, max: cellArch.maxBitsPerCell, step: 1 },
+    dataRateMTs: { min: rateMin, max: rateMax, step: rateStep },
+    voltageV: {
+      min: VOLTAGE_SLIDER_MIN,
+      max: getMaxMemoryVoltageForConfig(
+        draft.processNodeId,
+        draft.cellArchId,
+        draft.interfaceId,
+        draft.transistorStructureId,
+        clampedBits
+      ),
+      step: VOLTAGE_SLIDER_STEP,
+    },
+    busWidthOptions: iface.busWidths,
+    bankCountOptions: MEMORY_BANK_COUNTS,
+    eccLevel: { min: 0, max: 3, step: 1 },
+    powerLimitW: { min: 2, max: 350, step: 2 },
+  };
+}
+
+function clampMemoryDraftToBounds(draft: MemoryBlueprint, resetRateAndVoltage = false): MemoryBlueprint {
+  const cellArch = getMemoryCellArch(draft.cellArchId);
+  const iface = getMemoryInterface(draft.interfaceId);
+  const stackOptions = getAllowedStackLayersForArch(draft.cellArchId);
+  const stackLayers = stackOptions.includes(draft.stackLayers)
+    ? draft.stackLayers
+    : stackOptions[Math.min(stackOptions.length - 1, Math.floor(stackOptions.length / 2))] ?? 1;
+  const bitsPerCell = Math.max(1, Math.min(cellArch.maxBitsPerCell, Math.round(draft.bitsPerCell)));
+  const busWidthBits = iface.busWidths.includes(draft.busWidthBits)
+    ? draft.busWidthBits
+    : iface.busWidths[Math.min(1, iface.busWidths.length - 1)] ?? iface.busWidths[0];
+
+  const baseDraft: MemoryBlueprint = {
+    ...draft,
+    memoryCategory: cellArch.category,
+    stackLayers,
+    bitsPerCell,
+    busWidthBits,
+  };
+  const bounds = getMemorySliderBounds(baseDraft);
+  const effRef = getEffectiveRefMemoryDataRateMTs(
+    baseDraft.processNodeId,
+    baseDraft.cellArchId,
+    baseDraft.interfaceId,
+    baseDraft.transistorStructureId
+  );
+
+  const dataRateMTs = resetRateAndVoltage
+    ? clampToSlider(effRef, bounds.dataRateMTs)
+    : clampToSlider(baseDraft.dataRateMTs, bounds.dataRateMTs);
+
+  const vMin = computeMinStableMemoryVoltageV(
+    baseDraft.processNodeId,
+    baseDraft.cellArchId,
+    baseDraft.interfaceId,
+    baseDraft.transistorStructureId,
+    dataRateMTs,
+    bitsPerCell
+  );
+  const node = getProcessNode(baseDraft.processNodeId);
+  const voltageV = resetRateAndVoltage
+    ? getStabilizedVoltageV(Math.max(vMin, node.nominalVoltageV - VOLTAGE_SLIDER_STEP), bounds.voltageV)
+    : clampToSlider(baseDraft.voltageV, bounds.voltageV);
+
+  // Pick a sensible capacity inside the range if outside
+  const capInRange =
+    baseDraft.capacityGB >= bounds.capacityGB.min && baseDraft.capacityGB <= bounds.capacityGB.max;
+  const targetCap = capInRange
+    ? baseDraft.capacityGB
+    : bounds.capacityGB.min + (bounds.capacityGB.max - bounds.capacityGB.min) * 0.15;
+
+  return {
+    ...baseDraft,
+    capacityGB: clampToSlider(targetCap, bounds.capacityGB),
+    dataRateMTs,
+    voltageV,
+    eccLevel: clampToSlider(baseDraft.eccLevel, bounds.eccLevel),
+    powerLimitW: clampToSlider(baseDraft.powerLimitW, bounds.powerLimitW),
+  };
+}
+
+export function applyMemoryCategoryChange(
+  draft: MemoryBlueprint,
+  category: MemoryCategory,
+  unlockedTechIds: string[]
+): MemoryBlueprint {
+  const unlockedArchs = getUnlockedMemoryCellArchs(category, unlockedTechIds);
+  const unlockedIfaces = getUnlockedMemoryInterfaces(category, unlockedTechIds);
+  const nextArch =
+    unlockedArchs[unlockedArchs.length - 1] ??
+    MEMORY_CELL_ARCHS.find((a) => a.category === category) ??
+    MEMORY_CELL_ARCHS[0];
+  const nextIface =
+    unlockedIfaces[unlockedIfaces.length - 1] ??
+    MEMORY_INTERFACES.find((i) => i.category === category) ??
+    MEMORY_INTERFACES[0];
+
+  const defaultLayers =
+    nextArch.maxStackLayers >= 128
+      ? 64
+      : nextArch.maxStackLayers >= 8
+        ? 4
+        : 1;
+  const defaultBits = nextArch.maxBitsPerCell >= 3 ? 3 : nextArch.maxBitsPerCell >= 2 ? 2 : 1;
+  const defaultEcc = nextArch.category === 'rom_nand' ? (defaultBits >= 3 ? 2 : 1) : 1;
+
+  return clampMemoryDraftToBounds(
+    {
+      ...draft,
+      memoryCategory: category,
+      cellArchId: nextArch.id,
+      interfaceId: nextIface.id,
+      stackLayers: Math.min(defaultLayers, nextArch.maxStackLayers),
+      bitsPerCell: defaultBits,
+      eccLevel: defaultEcc,
+      busWidthBits: nextIface.busWidths[Math.min(1, nextIface.busWidths.length - 1)] ?? nextIface.busWidths[0],
+    },
+    true
+  );
+}
+
+export function applyMemoryNodeChange(draft: MemoryBlueprint, nodeId: string): MemoryBlueprint {
+  return clampMemoryDraftToBounds({ ...draft, processNodeId: nodeId }, true);
+}
+
+export function applyMemoryCellArchChange(draft: MemoryBlueprint, cellArchId: string): MemoryBlueprint {
+  const cellArch = getMemoryCellArch(cellArchId);
+  const stackOptions = getAllowedStackLayersForArch(cellArchId);
+  const preferredLayers = stackOptions.includes(draft.stackLayers)
+    ? draft.stackLayers
+    : stackOptions[Math.min(stackOptions.length - 1, Math.floor(stackOptions.length / 2))] ?? 1;
+  return clampMemoryDraftToBounds(
+    {
+      ...draft,
+      cellArchId,
+      memoryCategory: cellArch.category,
+      stackLayers: preferredLayers,
+      bitsPerCell: Math.min(draft.bitsPerCell, cellArch.maxBitsPerCell),
+    },
+    true
+  );
+}
+
+export function applyMemoryInterfaceChange(draft: MemoryBlueprint, interfaceId: string): MemoryBlueprint {
+  return clampMemoryDraftToBounds({ ...draft, interfaceId }, true);
+}
+
+export function applyMemoryTransistorChange(draft: MemoryBlueprint, transId: string): MemoryBlueprint {
+  return clampMemoryDraftToBounds({ ...draft, transistorStructureId: transId }, false);
+}
+
+export function applyMemoryStackOrBitsChange(
+  draft: MemoryBlueprint,
+  updates: { stackLayers?: number; bitsPerCell?: number }
+): MemoryBlueprint {
+  return clampMemoryDraftToBounds(
+    {
+      ...draft,
+      ...(updates.stackLayers !== undefined ? { stackLayers: updates.stackLayers } : {}),
+      ...(updates.bitsPerCell !== undefined ? { bitsPerCell: updates.bitsPerCell } : {}),
+    },
+    false
+  );
+}
+
 function computeFrontierModifiers(frontierLevels: Record<string, number>) {
   const lDens = frontierLevels['ft_density'] ?? 0;
   const lDef = frontierLevels['ft_defect'] ?? 0;
@@ -569,6 +983,8 @@ export function solveThermalAndPower(params: {
   transistorId: string;
   frontierThermalMult: number;
   frontierFluxPenalty: number;
+  extraThermalResistanceCPerW?: number;
+  throttleTempOverrideC?: number;
 }): {
   effectivePowerW: number;
   rawPowerW: number;
@@ -585,17 +1001,21 @@ export function solveThermalAndPower(params: {
   const cooling = getCoolingSpec(params.coolingId);
   const pkg = getPackagingSpec(params.packagingId);
 
-  // Effective thermal resistance
-  const baseR = Math.max(
-    0.032,
-    (cooling.thermalResistanceCPerW - pkg.thermalResistanceOffset) * params.frontierThermalMult
-  );
+  // Effective thermal resistance (including optional 3D stack TSV vertical resistance)
+  const baseR =
+    Math.max(
+      0.032,
+      (cooling.thermalResistanceCPerW - pkg.thermalResistanceOffset) * params.frontierThermalMult
+    ) + (params.extraThermalResistanceCPerW ?? 0);
 
-  // Photonic modulators have an optical drift ceiling at 78 C
-  const throttleTempC =
+  // Photonic modulators & photonic SCM cavities have an optical drift ceiling at 78 C
+  let throttleTempC =
     params.transistorId === 'trans_photonic_gate'
       ? Math.min(cooling.throttleTempC, 78)
       : cooling.throttleTempC;
+  if (params.throttleTempOverrideC !== undefined) {
+    throttleTempC = Math.min(throttleTempC, params.throttleTempOverrideC);
+  }
 
   const evalHotspotR = (flux: number) =>
     0.12 * Math.pow(Math.max(0.01, flux), 0.6) * params.frontierFluxPenalty;
@@ -1739,8 +2159,557 @@ export function evaluateGpuPhysics(spec: GpuBlueprint, ctx: PhysicsContext): Chi
   };
 }
 
+function buildMemoryFloorplan(params: {
+  bankCount: number;
+  stackLayers: number;
+  arrayArea: number;
+  senseAmpArea: number;
+  eccArea: number;
+  phyArea: number;
+  totalArea: number;
+  baseFlux: number;
+  isHbmTsv: boolean;
+}): DieBlockRect[] {
+  const blocks: DieBlockRect[] = [];
+  const safeTotal = Math.max(1, params.totalArea);
+
+  // Bottom / Center PHY & TSV I/O Spine
+  const phyH = Math.max(12, Math.min(24, (params.phyArea / safeTotal) * 100));
+  const eccH =
+    params.eccArea > 0.05 ? Math.max(9, Math.min(18, (params.eccArea / safeTotal) * 100)) : 0;
+
+  // Sense amplifier central horizontal spine
+  const senseH = Math.max(8, Math.min(14, (params.senseAmpArea / safeTotal) * 100));
+  const arrayTotalH = Math.max(42, 96 - phyH - eccH - senseH - (eccH > 0 ? 4.5 : 3));
+  const topArrayH = arrayTotalH / 2;
+  const botArrayH = arrayTotalH / 2;
+
+  const bankTilesPerHalf = Math.min(8, Math.max(2, Math.round(params.bankCount / 2)));
+  const cols = Math.min(4, Math.max(2, Math.ceil(bankTilesPerHalf / 2)));
+  const rows = Math.ceil(bankTilesPerHalf / cols);
+  const tw = (96 - (cols - 1) * 1.0) / cols;
+  const th = (topArrayH - (rows - 1) * 1.0) / rows;
+  const banksPerTile = Math.max(1, Math.round(params.bankCount / (bankTilesPerHalf * 2)));
+
+  // Top half memory bank arrays
+  for (let i = 0; i < bankTilesPerHalf; i++) {
+    const r = Math.floor(i / cols);
+    const c = i % cols;
+    blocks.push({
+      id: `bank_top_${i}`,
+      label: banksPerTile > 1 ? `B×${banksPerTile}` : `Bank ${i + 1}`,
+      category: 'mem_array',
+      x: 2 + c * (tw + 1.0),
+      y: 2 + r * (th + 1.0),
+      w: tw,
+      h: th,
+      areaMm2: params.arrayArea / (bankTilesPerHalf * 2),
+      heatFluxWPerMm2: params.baseFlux * 0.92,
+    });
+  }
+
+  // Central Sense Amplifiers & Row/Column Decoders
+  const senseY = 2 + topArrayH + 1.5;
+  blocks.push({
+    id: 'sense_spine',
+    label: 'Sense Amps & Row Decoders',
+    category: 'sense_amp',
+    x: 2,
+    y: senseY,
+    w: 96,
+    h: senseH,
+    areaMm2: params.senseAmpArea,
+    heatFluxWPerMm2: params.baseFlux * 1.24,
+  });
+
+  // Bottom half memory bank arrays
+  const botY = senseY + senseH + 1.5;
+  for (let i = 0; i < bankTilesPerHalf; i++) {
+    const r = Math.floor(i / cols);
+    const c = i % cols;
+    blocks.push({
+      id: `bank_bot_${i}`,
+      label: banksPerTile > 1 ? `B×${banksPerTile}` : `Bank ${bankTilesPerHalf + i + 1}`,
+      category: 'mem_array',
+      x: 2 + c * (tw + 1.0),
+      y: botY + r * (th + 1.0),
+      w: tw,
+      h: th,
+      areaMm2: params.arrayArea / (bankTilesPerHalf * 2),
+      heatFluxWPerMm2: params.baseFlux * 0.92,
+    });
+  }
+
+  let nextY = botY + botArrayH + 1.5;
+  if (eccH > 0) {
+    blocks.push({
+      id: 'ecc_engine',
+      label: 'On-Die ECC & Wear Controller',
+      category: 'ecc_ctrl',
+      x: 2,
+      y: nextY,
+      w: 96,
+      h: eccH,
+      areaMm2: params.eccArea,
+      heatFluxWPerMm2: params.baseFlux * 1.18,
+    });
+    nextY += eccH + 1.5;
+  }
+
+  blocks.push({
+    id: 'mem_phy',
+    label: params.isHbmTsv
+      ? `TSV Micro-Bump PHY (${params.stackLayers}-Hi)`
+      : 'High-Speed I/O PHY',
+    category: 'tsv_phy',
+    x: 2,
+    y: Math.min(98 - phyH, nextY),
+    w: 96,
+    h: Math.max(8, 98 - Math.min(98 - phyH, nextY)),
+    areaMm2: params.phyArea,
+    heatFluxWPerMm2: params.baseFlux * 1.32,
+  });
+
+  return blocks;
+}
+
+/**
+ * Evaluate a Memory or Solid-State Storage blueprint through the physics & benchmark kernel.
+ */
+export function evaluateMemoryPhysics(spec: MemoryBlueprint, ctx: PhysicsContext): ChipEvaluation {
+  const node = getProcessNode(spec.processNodeId);
+  const trans = getTransistorStructure(spec.transistorStructureId);
+  const pkg = getPackagingSpec(spec.packagingId);
+  const cellArch = getMemoryCellArch(spec.cellArchId);
+  const iface = getMemoryInterface(spec.interfaceId);
+  const litho = getBestLithography(ctx.unlockedTechIds);
+  const waferDia = getMaxWaferDiameterMm(ctx.unlockedTechIds);
+  const frontier = computeFrontierModifiers(ctx.frontierLevels);
+
+  const stackLayers = Math.max(1, Math.min(cellArch.maxStackLayers, spec.stackLayers));
+  const bitsPerCell = Math.max(1, Math.min(cellArch.maxBitsPerCell, spec.bitsPerCell));
+  const eccIdx = Math.max(0, Math.min(ECC_LEVEL_META.length - 1, Math.round(spec.eccLevel)));
+  const eccMeta = ECC_LEVEL_META[eccIdx];
+  const bitsMeta = BITS_PER_CELL_META[Math.max(0, Math.min(BITS_PER_CELL_META.length - 1, bitsPerCell - 1))];
+
+  // 1. Array Density & Area Budget
+  const rawBitsGbit = Math.max(0.001, spec.capacityGB * 8);
+  const arrayCellsM = (rawBitsGbit * 1000) / bitsPerCell;
+
+  const nodeDensityScale =
+    Math.pow(node.sramDensityMTrPerMm2 / 44, 0.72) *
+    Math.sqrt(trans.densityMultiplier) *
+    frontier.densityMult;
+  const layerAlpha = cellArch.category === 'rom_nand' ? 0.91 : 0.94;
+  const effectiveLayerGain = Math.pow(stackLayers, layerAlpha);
+  const effectiveDensityGbitPerMm2 =
+    (cellArch.baseGbitPerMm2 * nodeDensityScale * effectiveLayerGain * bitsPerCell) /
+    (1 + eccMeta.areaOverhead);
+
+  // Periphery CMOS logic (Sense Amps, ECC controller, I/O PHY)
+  const effLogicDensity = node.logicDensityMTrPerMm2 * trans.densityMultiplier * frontier.densityMult;
+  const busSlices = Math.max(1, spec.busWidthBits / 16);
+
+  const senseAmpMTr = Math.max(0.04, spec.bankCount * Math.pow(node.logicDensityMTrPerMm2, 0.45) * 0.42);
+  const eccCtrlMTr =
+    spec.eccLevel > 0
+      ? spec.eccLevel * Math.max(0.04, Math.pow(spec.bankCount, 0.68) * Math.pow(node.logicDensityMTrPerMm2, 0.48) * 0.36)
+      : 0;
+  const phyMTr = busSlices * Math.max(0.05, Math.pow(node.logicDensityMTrPerMm2, 0.44) * 0.22);
+
+  const logicMTr = senseAmpMTr + eccCtrlMTr + phyMTr;
+  const uncoreMTr = eccCtrlMTr + phyMTr;
+  const cacheMTr = arrayCellsM;
+  const transistorCountMTr = logicMTr + cacheMTr;
+
+  const arrayArea = Math.max(2.0, rawBitsGbit / Math.max(1e-6, effectiveDensityGbitPerMm2));
+  const eccArea = arrayArea * eccMeta.areaOverhead + (eccCtrlMTr > 0 ? eccCtrlMTr / effLogicDensity : 0);
+  const senseAmpArea = Math.max(
+    0.8,
+    arrayArea * (0.075 + 0.0025 * spec.bankCount) + senseAmpMTr / effLogicDensity
+  );
+  const phyArea = Math.max(
+    1.2,
+    busSlices * iface.phyAreaPerSliceMm2 * Math.pow(Math.max(1, node.featureSizeNm / 14), 0.14) +
+      phyMTr / effLogicDensity
+  );
+
+  const dieAreaMm2 = Math.max(4.0, arrayArea + eccArea + senseAmpArea + phyArea);
+  const reticleLimitMm2 = Math.min(
+    pkg.maxDieAreaMm2,
+    litho.reticleLimitMm2 *
+      (pkg.id === 'pkg_interposer' || pkg.id === 'pkg_3d_wow' || pkg.id === 'pkg_optical_substrate'
+        ? 2.5
+        : 1.0)
+  );
+  const exceedsReticle = dieAreaMm2 > reticleLimitMm2;
+
+  // 2. Voltage Wall, Active Power, Refresh Power & Thermal Equilibrium
+  const effRefRateMTs = getEffectiveRefMemoryDataRateMTs(
+    spec.processNodeId,
+    spec.cellArchId,
+    spec.interfaceId,
+    spec.transistorStructureId
+  );
+  const minStableVoltageV = computeMinStableMemoryVoltageV(
+    spec.processNodeId,
+    spec.cellArchId,
+    spec.interfaceId,
+    spec.transistorStructureId,
+    spec.dataRateMTs,
+    bitsPerCell
+  );
+  const voltageUnstable = spec.voltageV < minStableVoltageV - 0.005;
+
+  const rateRatio = spec.dataRateMTs / Math.max(10, effRefRateMTs);
+  const voltNorm = spec.voltageV / Math.max(0.4, node.nominalVoltageV);
+
+  const phyDynW = busSlices * iface.phyPowerPerSliceW * voltNorm * voltNorm * Math.pow(rateRatio, 1.35);
+  const arrayDynW =
+    cellArch.activePowerFactor *
+    Math.sqrt(Math.max(0.5, spec.bankCount)) *
+    Math.pow(Math.max(0.01, spec.capacityGB), 0.2) *
+    (1 + (bitsPerCell - 1) * 0.14) *
+    voltNorm *
+    voltNorm *
+    Math.pow(rateRatio, 1.4);
+  const eccDynW = spec.eccLevel * 0.28 * Math.sqrt(spec.bankCount / 4) * rateRatio;
+  const dynamicPowerAtTargetW = Math.max(0.15, phyDynW + arrayDynW + eccDynW);
+
+  const refreshPowerAt25W = cellArch.nonVolatile
+    ? 0
+    : cellArch.refreshPowerFactor * Math.pow(Math.max(0.001, spec.capacityGB), 0.52) * voltNorm;
+
+  const peripheryLeakAt25W =
+    node.leakageCoeff *
+    trans.leakageMultiplier *
+    (logicMTr + Math.sqrt(Math.max(0.1, arrayCellsM)) * 0.14) *
+    spec.voltageV;
+  const baseLeakageAt25CW = peripheryLeakAt25W + refreshPowerAt25W;
+
+  const tunnelingPowerW =
+    node.tunnelingFloorWPerMTr *
+    (1 - trans.tunnelingMitigation) *
+    (logicMTr + Math.sqrt(Math.max(0.1, arrayCellsM)) * 0.08);
+
+  const stackThermalR =
+    stackLayers > 1
+      ? (cellArch.category === 'rom_nand' ? 0.025 : 0.06) * Math.log2(stackLayers)
+      : 0;
+
+  const thermal = solveThermalAndPower({
+    dynamicPowerAtTargetW,
+    baseLeakageAt25CW,
+    tunnelingPowerW,
+    powerLimitW: spec.powerLimitW,
+    dieAreaMm2,
+    coolingId: spec.coolingId,
+    packagingId: spec.packagingId,
+    transistorId: spec.transistorStructureId,
+    frontierThermalMult: frontier.thermalResMult,
+    frontierFluxPenalty: frontier.fluxPenaltyMult,
+    extraThermalResistanceCPerW: stackThermalR,
+    throttleTempOverrideC: cellArch.id === 'mem_photonic_holo' ? 78 : undefined,
+  });
+
+  const tempArg = Math.max(-140, Math.min(180, thermal.junctionTempC));
+  const refreshPowerW = Number((refreshPowerAt25W * Math.exp((tempArg - 25) / 42)).toFixed(2));
+  const combinedRateRatio = thermal.powerThrottledRatio * thermal.thermalThrottledRatio;
+  const sustainedDataRateMTs = Math.round(spec.dataRateMTs * combinedRateRatio);
+  const sustainedClockGHz = sustainedDataRateMTs / (Math.max(1, iface.signalingMultiplier) * 1000);
+
+  // 3. Wafer Yield (Murphy + 3D Stack Defect Compounding + ECC Spare Rescue)
+  const maturationMult = 0.45 + 0.55 * Math.exp(-0.08 * Math.max(0, ctx.maturationXp));
+  const cleanroomMult = Math.pow(0.86, Math.max(0, ctx.cleanroomGrade - 1));
+  const stackDefectFactor =
+    1 + (cellArch.category === 'rom_nand' ? 0.055 : 0.14) * Math.log2(stackLayers);
+  const bitsDefectFactor = 1 + (bitsPerCell - 1) * 0.09;
+  const eccRescueFactor = 1 - eccMeta.defectMitigation;
+
+  const effectiveDefectDensity =
+    node.baseDefectDensity *
+    litho.defectMultiplier *
+    trans.defectMultiplier *
+    pkg.defectMultiplier *
+    cellArch.defectMultiplier *
+    stackDefectFactor *
+    bitsDefectFactor *
+    eccRescueFactor *
+    cleanroomMult *
+    maturationMult *
+    frontier.defectMult;
+
+  const qaFactor = 0.94 + ctx.qaBudgetLevel * 0.015 + ((ctx.qaStrictness ?? 1.0) - 1.0) * 0.04;
+  const grossDiesPerWafer = exceedsReticle ? 0 : computeGrossDiesPerWafer(waferDia, dieAreaMm2);
+  const yieldPercent = exceedsReticle
+    ? 0
+    : computeMurphyYield(dieAreaMm2, effectiveDefectDensity, qaFactor);
+  const goodDiesPerWafer = (grossDiesPerWafer * yieldPercent) / 100;
+
+  // 4. Bandwidth, Latency, Endurance & Benchmarks
+  const stabilityPenalty = voltageUnstable ? 0.35 : 1.0;
+  const memoryBandwidthGBs =
+    (spec.busWidthBits / 8) * (sustainedDataRateMTs / 1000) * stabilityPenalty;
+
+  const bankRelief = 1 / (1 + 0.09 * Math.log2(Math.max(1, spec.bankCount / 4)));
+  const rateRelief = Math.pow(effRefRateMTs / Math.max(10, sustainedDataRateMTs), 0.32);
+  const stackLatencyMult = 1 + 0.025 * Math.log2(stackLayers);
+  const accessLatencyNs = Number(
+    (
+      cellArch.baseLatencyNs *
+      bitsMeta.latencyMult *
+      eccMeta.latencyMult *
+      stackLatencyMult *
+      bankRelief *
+      rateRelief
+    ).toFixed(1)
+  );
+
+  const enduranceCycles = Math.round(
+    cellArch.baseEnduranceCycles * bitsMeta.enduranceMult * eccMeta.enduranceMult
+  );
+  const enduranceTBW = Math.round((spec.capacityGB * Math.min(enduranceCycles, 1e9)) / 1000);
+  const iopsK = Math.max(
+    1,
+    Math.round(spec.bankCount * (1e6 / Math.max(4, accessLatencyNs)) * 0.045 * stabilityPenalty)
+  );
+
+  const sequentialThroughput = Math.round(memoryBandwidthGBs * 18);
+  const randomAccessScore = Math.round(
+    Math.pow(Math.max(1, iopsK), 0.72) * 14 + (1000 / Math.max(5, accessLatencyNs)) * 35
+  );
+  const storageDensityScore = Math.round(
+    Math.pow(Math.max(0.001, spec.capacityGB * 1000), 0.52) *
+      (1 + 0.25 * Math.log10(1 + effectiveDensityGbitPerMm2 * 10))
+  );
+  const enduranceReliability = cellArch.nonVolatile
+    ? Math.max(
+        10,
+        Math.min(100, Math.round(Math.log10(Math.max(10, enduranceCycles)) * 13.5 + spec.eccLevel * 6))
+      )
+    : Math.min(100, Math.round(82 + spec.eccLevel * 6));
+
+  const memoryPerformance = Math.round(sequentialThroughput * 0.55 + randomAccessScore * 0.45);
+  const generalComputing = Math.round(storageDensityScore * 0.5 + randomAccessScore * 0.5);
+
+  let overallRating = 0;
+  if (cellArch.category === 'dram') {
+    overallRating = Math.round(
+      sequentialThroughput * 0.38 +
+        randomAccessScore * 0.34 +
+        storageDensityScore * 0.18 +
+        enduranceReliability * 1.2
+    );
+  } else if (cellArch.category === 'vram') {
+    overallRating = Math.round(
+      sequentialThroughput * 0.56 +
+        randomAccessScore * 0.22 +
+        storageDensityScore * 0.16 +
+        enduranceReliability * 0.8
+    );
+  } else if (cellArch.category === 'rom_nand') {
+    overallRating = Math.round(
+      storageDensityScore * 0.42 +
+        sequentialThroughput * 0.26 +
+        randomAccessScore * 0.18 +
+        enduranceReliability * 2.4
+    );
+  } else {
+    overallRating = Math.round(
+      randomAccessScore * 0.36 +
+        sequentialThroughput * 0.28 +
+        storageDensityScore * 0.24 +
+        enduranceReliability * 1.8
+    );
+  }
+
+  const totalSystemPowerW = thermal.effectivePowerW + thermal.carnotOverheadW;
+  const powerEfficiency = Math.round((overallRating / Math.max(0.5, totalSystemPowerW)) * 10);
+  const thermalHeadroom = thermal.throttleTempC - thermal.junctionTempC;
+  const thermalPerformance = Math.max(
+    5,
+    Math.min(100, Math.round(68 + thermalHeadroom * 0.9 - (1 - thermal.thermalThrottledRatio) * 85))
+  );
+
+  // 5. Plain-English Bottleneck Diagnostics
+  const bottlenecks: BottleneckDiagnostic[] = [];
+
+  if (exceedsReticle) {
+    bottlenecks.push({
+      id: 'mem_reticle',
+      severity: 'critical',
+      title: 'Memory Die Exceeds Reticle / Package Limit',
+      explanation: `At ${dieAreaMm2.toFixed(1)} mm², this memory die exceeds the ${reticleLimitMm2.toFixed(0)} mm² limit.`,
+      recommendation: 'Add vertical 3D stack layers, increase bits-per-cell, reduce capacity, or migrate to a denser node.',
+    });
+  }
+
+  if (voltageUnstable) {
+    bottlenecks.push({
+      id: 'mem_voltage',
+      severity: 'critical',
+      title: 'Supply Voltage Below Stability Threshold',
+      explanation: `${spec.dataRateMTs.toLocaleString()} MT/s (${bitsMeta.shortLabel}) requires ≥ ${minStableVoltageV.toFixed(2)} V, but VDD is ${spec.voltageV.toFixed(2)} V.`,
+      recommendation: `Click Auto-Stabilize or raise VDD to ≥ ${minStableVoltageV.toFixed(2)} V to eliminate bit errors.`,
+    });
+  }
+
+  if (cellArch.nonVolatile && bitsPerCell >= 3 && spec.eccLevel < 2) {
+    bottlenecks.push({
+      id: 'mem_ecc_needed',
+      severity: bitsPerCell >= 4 ? 'critical' : 'warning',
+      title: `${bitsMeta.shortLabel} High Bit-Error Exposure`,
+      explanation: `${bitsMeta.states} charge states per cell with ${eccMeta.label} ECC leaves raw endurance at ${enduranceCycles.toLocaleString()} P/E cycles and hurts wafer yield.`,
+      recommendation: 'Enable LDPC or Deep AI-LDPC on-die ECC to rescue defective columns and multiply write endurance.',
+    });
+  }
+
+  if (!cellArch.nonVolatile && refreshPowerW > thermal.effectivePowerW * 0.25 && thermal.junctionTempC > 72) {
+    bottlenecks.push({
+      id: 'mem_refresh_spike',
+      severity: 'warning',
+      title: 'Elevated DRAM Refresh Power',
+      explanation: `At ${thermal.junctionTempC.toFixed(1)} °C, capacitor charge leakage requires ${refreshPowerW.toFixed(1)} W of continuous refresh current.`,
+      recommendation: 'Improve cooling, lower VDD, or transition to High-k Stacked-Capacitor DRAM.',
+    });
+  }
+
+  if (thermal.thermalFloorHit) {
+    bottlenecks.push({
+      id: 'mem_thermal_runaway',
+      severity: 'critical',
+      title: 'Thermal Runaway — Minimum Throttle Floor Hit',
+      explanation: `Even at ${(THERMAL_RATIO_FLOOR * 100).toFixed(0)}% transfer rate, junction temperature stays at ${thermal.junctionTempC.toFixed(1)} °C (limit ${thermal.throttleTempC} °C).`,
+      recommendation: 'Upgrade cooling, lower data rate or VDD, or trim 3D stack height to reduce vertical thermal resistance.',
+    });
+  } else if (thermal.thermalThrottledRatio < 0.96) {
+    const lossPct = Math.round((1 - thermal.thermalThrottledRatio) * 100);
+    bottlenecks.push({
+      id: 'mem_thermal',
+      severity: thermal.thermalThrottledRatio < 0.78 ? 'critical' : 'warning',
+      title: `Thermal Throttling (-${lossPct}% Data Rate)`,
+      explanation: `Array reached ${thermal.junctionTempC.toFixed(1)} °C (limit ${thermal.throttleTempC} °C)${stackLayers > 1 ? ` across ${stackLayers} stacked vertical layers` : ''}.`,
+      recommendation: 'Upgrade cooling or packaging thermal spreader, or trim target MT/s and supply voltage.',
+    });
+  }
+
+  if (thermal.powerThrottledRatio < 0.92) {
+    const lossPct = Math.round((1 - thermal.powerThrottledRatio) * 100);
+    bottlenecks.push({
+      id: 'mem_power_cap',
+      severity: 'warning',
+      title: `Power Limit Capped (-${lossPct}% Data Rate)`,
+      explanation: `Uncapped power (${thermal.rawPowerW.toFixed(1)} W) exceeds the ${spec.powerLimitW} W module power envelope.`,
+      recommendation: 'Raise module power limit or reduce bus width / signaling rate.',
+    });
+  }
+
+  if (yieldPercent < 42 && !exceedsReticle) {
+    bottlenecks.push({
+      id: 'mem_low_yield',
+      severity: 'warning',
+      title: `Low Memory Wafer Yield (${yieldPercent.toFixed(1)}%)`,
+      explanation: `${dieAreaMm2.toFixed(1)} mm² die with ${stackLayers}-layer stacking yields poorly at ${effectiveDefectDensity.toFixed(2)} defects/cm².`,
+      recommendation: 'Raise on-die ECC redundancy tier, mature the process node, or trim die capacity.',
+    });
+  }
+
+  if (bottlenecks.length === 0) {
+    bottlenecks.push({
+      id: 'mem_balanced',
+      severity: 'info',
+      title: 'Balanced Memory / Storage Architecture',
+      explanation: 'Areal bit density, interface bandwidth, endurance, thermals, and wafer yield are cleanly aligned.',
+      recommendation: 'Ready for tape-out and volume production.',
+    });
+  }
+
+  const floorplanBlocks = buildMemoryFloorplan({
+    bankCount: spec.bankCount,
+    stackLayers,
+    arrayArea,
+    senseAmpArea,
+    eccArea,
+    phyArea,
+    totalArea: dieAreaMm2,
+    baseFlux: thermal.heatFluxWPerMm2,
+    isHbmTsv: spec.interfaceId === 'iface_hbm_tsv' || stackLayers >= 4,
+  });
+
+  const complexity =
+    Math.log10(10 + rawBitsGbit * 8 + logicMTr * 10) * (1 + Math.log2(stackLayers) * 0.12);
+  const tapeOutCreditCost = Math.round(240 * complexity * (1 + dieAreaMm2 / 420));
+  const tapeOutDays = Math.round(Math.min(480, (20 + complexity * 15) * frontier.tapeOutTimeMult));
+  const computePowerRating = Math.max(1, overallRating * 0.0115);
+
+  return {
+    physics: {
+      transistorCountMTr,
+      logicMTr,
+      cacheMTr,
+      uncoreMTr,
+      dieAreaMm2,
+      reticleLimitMm2,
+      exceedsReticle,
+      minStableVoltageV,
+      voltageUnstable,
+      dynamicPowerW: thermal.dynamicPowerW,
+      leakagePowerW: thermal.leakagePowerW,
+      tunnelingPowerW,
+      carnotOverheadW: thermal.carnotOverheadW,
+      rawPowerW: thermal.rawPowerW,
+      effectivePowerW: thermal.effectivePowerW,
+      powerThrottledRatio: thermal.powerThrottledRatio,
+      heatFluxWPerMm2: thermal.heatFluxWPerMm2,
+      junctionTempC: thermal.junctionTempC,
+      throttleTempC: thermal.throttleTempC,
+      thermalThrottledRatio: thermal.thermalThrottledRatio,
+      thermalFloorHit: thermal.thermalFloorHit,
+      sustainedClockGHz,
+      memoryBandwidthGBs,
+      grossDiesPerWafer,
+      effectiveDefectDensity,
+      yieldPercent,
+      goodDiesPerWafer,
+      floorplanBlocks,
+      computePowerRating,
+      tapeOutCreditCost,
+      tapeOutDays,
+      capacityGB: spec.capacityGB,
+      densityGbitPerMm2: Number(effectiveDensityGbitPerMm2.toFixed(4)),
+      accessLatencyNs,
+      enduranceCycles,
+      enduranceTBW,
+      refreshPowerW,
+      sustainedDataRateMTs,
+      iopsK,
+      stackLayers,
+      nonVolatile: cellArch.nonVolatile,
+    },
+    benchmarks: {
+      singleCoreCpu: 0,
+      multiCoreCpu: 0,
+      generalComputing,
+      memoryPerformance,
+      gamingRendering: 0,
+      gpuCompute: 0,
+      powerEfficiency,
+      thermalPerformance,
+      overallRating,
+      bottlenecks,
+      sequentialThroughput,
+      randomAccessScore,
+      storageDensityScore,
+      enduranceReliability,
+    },
+    cacheKey: `${spec.id}_r${spec.revision}_m${Math.floor(ctx.maturationXp)}_c${ctx.cleanroomGrade}_q${ctx.qaBudgetLevel}`,
+  };
+}
+
 export function evaluateChip(spec: ChipBlueprint, ctx: PhysicsContext): ChipEvaluation {
-  return spec.kind === 'cpu' ? evaluateCpuPhysics(spec, ctx) : evaluateGpuPhysics(spec, ctx);
+  if (spec.kind === 'cpu') return evaluateCpuPhysics(spec, ctx);
+  if (spec.kind === 'gpu') return evaluateGpuPhysics(spec, ctx);
+  return evaluateMemoryPhysics(spec, ctx);
 }
 
 /**

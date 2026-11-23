@@ -10,6 +10,8 @@ import {
   FACILITY_BLUEPRINTS,
   getBestUnlockedProcessNode,
   GPU_ARCHITECTURES,
+  MEMORY_CELL_ARCHS,
+  MEMORY_INTERFACES,
   PROCESS_NODES,
   TRANSISTOR_STRUCTURES,
 } from './catalog';
@@ -20,10 +22,15 @@ import {
   ChipMetricsCache,
   evaluateCpuPhysics,
   evaluateGpuPhysics,
+  evaluateMemoryPhysics,
   getCpuSliderBounds,
   getGpuSliderBounds,
   getMaxClockForArch,
+  getMaxMemoryDataRateMTs,
+  getMaxMemoryVoltageForConfig,
   getMaxVoltageForConfig,
+  getMemorySliderBounds,
+  getStabilizedVoltageV,
   solveThermalAndPower,
   THERMAL_RATIO_FLOOR,
   type PhysicsContext,
@@ -35,11 +42,14 @@ import {
   createInitialState,
   createStarterCpuDraft,
   createStarterGpuDraft,
+  createStarterMemoryDraft,
+  migrateGameState,
   queueFacilityBuild,
   queueFacilityUpgrade,
   recomputeTelemetry,
   startChipTapeOut,
 } from './simulation';
+import type { GameState, MemoryBlueprint } from './types';
 
 const BASE_CTX: PhysicsContext = {
   unlockedTechIds: [
@@ -189,14 +199,17 @@ test('2. solveThermalAndPower settles Tj <= throttleTempC unless 0.22 floor is h
   const hotCpu = evaluateCpuPhysics(
     {
       ...createStarterCpuDraft(),
-      processNodeId: 'node_45nm',
+      processNodeId: 'node_130nm',
       architectureId: 'cpu_ooo',
       transistorStructureId: 'trans_planar',
-      packagingId: 'pkg_lga',
+      packagingId: 'pkg_dip',
       coolingId: 'cool_passive',
-      pCores: 16,
-      pClockGHz: 3.2,
-      voltageV: 1.5,
+      pCores: 32,
+      eCores: 16,
+      pClockGHz: 2.8,
+      eClockGHz: 2.2,
+      voltageV: 2.2,
+      l3CacheMBTotal: 64,
       powerLimitW: 1200,
     },
     BASE_CTX
@@ -521,6 +534,347 @@ test('10. Architect preview yield matches production line yield on best fab (wit
     Number(prodLine.yieldPercent.toFixed(4)),
     `Preview yield (${previewEval.physics.yieldPercent}) != production yield (${prodLine.yieldPercent})`
   );
+});
+
+// ─── TEST 11: Every (node, cellArch, interface, trans) memory combo is stable at max rate + max voltage ──
+test('11. Every (node, cellArch, interface, trans) memory combination is voltage-stable at max rate + max voltage', () => {
+  const memBase = createStarterMemoryDraft();
+  let checked = 0;
+
+  for (const node of PROCESS_NODES) {
+    for (const trans of TRANSISTOR_STRUCTURES) {
+      for (const cellArch of MEMORY_CELL_ARCHS) {
+        const compatibleIfaces = MEMORY_INTERFACES.filter(
+          (i) => i.category === cellArch.category
+        );
+        for (const iface of compatibleIfaces) {
+          const bitsPerCell = cellArch.maxBitsPerCell;
+          const maxRate = getMaxMemoryDataRateMTs(node.id, cellArch.id, iface.id, trans.id);
+          const maxVolt = getMaxMemoryVoltageForConfig(
+            node.id,
+            cellArch.id,
+            iface.id,
+            trans.id,
+            bitsPerCell
+          );
+          const res = evaluateMemoryPhysics(
+            {
+              ...memBase,
+              memoryCategory: cellArch.category,
+              processNodeId: node.id,
+              cellArchId: cellArch.id,
+              interfaceId: iface.id,
+              transistorStructureId: trans.id,
+              bitsPerCell,
+              stackLayers: 1,
+              busWidthBits: iface.busWidths[0],
+              dataRateMTs: maxRate,
+              voltageV: maxVolt,
+            },
+            BASE_CTX
+          );
+          assert.equal(
+            res.physics.voltageUnstable,
+            false,
+            `Memory unstable at max rate (${maxRate} MT/s) & max voltage (${maxVolt} V, Vmin=${res.physics.minStableVoltageV} V) for ${node.id}/${cellArch.id}/${iface.id}/${trans.id}`
+          );
+          checked += 1;
+        }
+      }
+    }
+  }
+  assert.ok(checked > 0, 'Expected at least one memory combination checked');
+});
+
+// ─── TEST 12: Auto-Stabilize Voltage helper works for CPU, GPU, and Memory at max clock/rate ──
+test('12. getStabilizedVoltageV produces slider-aligned, voltage-stable voltages for CPU, GPU, and Memory', () => {
+  // CPU at max clock
+  const cpuDraft = createStarterCpuDraft();
+  const cpuBounds = getCpuSliderBounds(cpuDraft);
+  const cpuMaxClock = { ...cpuDraft, pClockGHz: cpuBounds.pClockGHz.max, voltageV: cpuBounds.voltageV.min };
+  const cpuUnstable = evaluateCpuPhysics(cpuMaxClock, BASE_CTX);
+  const cpuStabV = getStabilizedVoltageV(cpuUnstable.physics.minStableVoltageV, cpuBounds.voltageV);
+  assertInSliderRange('cpu.stabilizedV', cpuStabV, cpuBounds.voltageV);
+  const cpuStable = evaluateCpuPhysics({ ...cpuMaxClock, voltageV: cpuStabV }, BASE_CTX);
+  assert.equal(cpuStable.physics.voltageUnstable, false, 'CPU should be stable after getStabilizedVoltageV');
+
+  // GPU at max clock
+  const gpuDraft = createStarterGpuDraft();
+  const gpuBounds = getGpuSliderBounds(gpuDraft);
+  const gpuMaxClock = { ...gpuDraft, clockGHz: gpuBounds.clockGHz.max, voltageV: gpuBounds.voltageV.min };
+  const gpuUnstable = evaluateGpuPhysics(gpuMaxClock, BASE_CTX);
+  const gpuStabV = getStabilizedVoltageV(gpuUnstable.physics.minStableVoltageV, gpuBounds.voltageV);
+  assertInSliderRange('gpu.stabilizedV', gpuStabV, gpuBounds.voltageV);
+  const gpuStable = evaluateGpuPhysics({ ...gpuMaxClock, voltageV: gpuStabV }, BASE_CTX);
+  assert.equal(gpuStable.physics.voltageUnstable, false, 'GPU should be stable after getStabilizedVoltageV');
+
+  // Memory at max data rate
+  const memDraft = createStarterMemoryDraft();
+  const memBounds = getMemorySliderBounds(memDraft);
+  const memMaxRate = { ...memDraft, dataRateMTs: memBounds.dataRateMTs.max, voltageV: memBounds.voltageV.min };
+  const memUnstable = evaluateMemoryPhysics(memMaxRate, BASE_CTX);
+  const memStabV = getStabilizedVoltageV(memUnstable.physics.minStableVoltageV, memBounds.voltageV);
+  assertInSliderRange('mem.stabilizedV', memStabV, memBounds.voltageV);
+  const memStable = evaluateMemoryPhysics({ ...memMaxRate, voltageV: memStabV }, BASE_CTX);
+  assert.equal(memStable.physics.voltageUnstable, false, 'Memory should be stable after getStabilizedVoltageV');
+});
+
+// ─── TEST 13: Starter Memory draft lies inside slider bounds & is voltage-stable ──
+test('13. Starter Memory draft lies inside all getMemorySliderBounds ranges & steps and is voltage-stable', () => {
+  const initState = createInitialState();
+  const mem = createStarterMemoryDraft();
+  const mb = getMemorySliderBounds(mem);
+
+  assertInSliderRange('memoryDraft.capacityGB', mem.capacityGB, mb.capacityGB);
+  assertInSliderRange('memoryDraft.dataRateMTs', mem.dataRateMTs, mb.dataRateMTs);
+  assertInSliderRange('memoryDraft.voltageV', mem.voltageV, mb.voltageV);
+  assertInSliderRange('memoryDraft.powerLimitW', mem.powerLimitW, mb.powerLimitW);
+  assert.ok(mb.busWidthOptions.includes(mem.busWidthBits), 'Starter busWidthBits should be allowed');
+  assert.ok(mb.stackLayersOptions.includes(mem.stackLayers), 'Starter stackLayers should be allowed');
+
+  const ctx = buildPreviewPhysicsContext(initState, mem.processNodeId, 1.0);
+  const ev = evaluateMemoryPhysics(mem, ctx);
+  assert.equal(ev.physics.voltageUnstable, false, 'Starter memory draft must be voltage-stable');
+});
+
+// ─── TEST 14: Coupled Memory engineering trade-offs (bitsPerCell, ECC, 3D stackLayers) ──
+test('14. Memory trade-offs: bitsPerCell, eccLevel, and 3D stackLayers show physical coupling', () => {
+  const nandBase: MemoryBlueprint = {
+    ...createStarterMemoryDraft(),
+    id: 'test_nand',
+    name: 'Test 3D NAND',
+    memoryCategory: 'rom_nand',
+    processNodeId: 'node_14nm',
+    transistorStructureId: 'trans_finfet',
+    cellArchId: 'mem_3d_vnand',
+    interfaceId: 'iface_pcie_nvme_ctrl',
+    packagingId: 'pkg_flipchip',
+    coolingId: 'cool_heatpipe',
+    capacityGB: 32,
+    stackLayers: 64,
+    bitsPerCell: 1,
+    bankCount: 16,
+    busWidthBits: 64,
+    dataRateMTs: 1600,
+    voltageV: 1.05,
+    eccLevel: 1,
+    powerLimitW: 25,
+  };
+
+  // (a) Raising bitsPerCell (SLC 1 -> QLC 4) shrinks die area & increases density,
+  //     but slashes enduranceCycles and increases accessLatencyNs.
+  const slc = evaluateMemoryPhysics({ ...nandBase, bitsPerCell: 1 }, BASE_CTX);
+  const qlc = evaluateMemoryPhysics({ ...nandBase, bitsPerCell: 4 }, BASE_CTX);
+  assert.ok(
+    qlc.physics.dieAreaMm2 < slc.physics.dieAreaMm2,
+    `Expected QLC dieArea (${qlc.physics.dieAreaMm2}) < SLC dieArea (${slc.physics.dieAreaMm2})`
+  );
+  assert.ok(
+    (qlc.physics.densityGbitPerMm2 ?? 0) > (slc.physics.densityGbitPerMm2 ?? 0),
+    'Expected QLC areal density > SLC areal density'
+  );
+  assert.ok(
+    (qlc.physics.enduranceCycles ?? 0) < (slc.physics.enduranceCycles ?? 0),
+    `Expected QLC enduranceCycles (${qlc.physics.enduranceCycles}) < SLC (${slc.physics.enduranceCycles})`
+  );
+  assert.ok(
+    (qlc.physics.accessLatencyNs ?? 0) > (slc.physics.accessLatencyNs ?? 0),
+    `Expected QLC latency (${qlc.physics.accessLatencyNs}) > SLC (${slc.physics.accessLatencyNs})`
+  );
+
+  // (b) Raising ECC (0 -> 3) improves yieldPercent and enduranceCycles at an area cost
+  const ecc0 = evaluateMemoryPhysics({ ...nandBase, bitsPerCell: 3, eccLevel: 0 }, BASE_CTX);
+  const ecc3 = evaluateMemoryPhysics({ ...nandBase, bitsPerCell: 3, eccLevel: 3 }, BASE_CTX);
+  assert.ok(
+    ecc3.physics.dieAreaMm2 > ecc0.physics.dieAreaMm2,
+    `Expected ECC-3 dieArea (${ecc3.physics.dieAreaMm2}) > ECC-0 (${ecc0.physics.dieAreaMm2})`
+  );
+  assert.ok(
+    ecc3.physics.yieldPercent > ecc0.physics.yieldPercent,
+    `Expected ECC-3 yield (${ecc3.physics.yieldPercent}%) > ECC-0 (${ecc0.physics.yieldPercent}%)`
+  );
+  assert.ok(
+    (ecc3.physics.enduranceCycles ?? 0) > (ecc0.physics.enduranceCycles ?? 0),
+    'Expected ECC-3 enduranceCycles > ECC-0'
+  );
+
+  // (c) Raising 3D stackLayers (16 -> 128) shrinks die footprint & raises density,
+  //     while raising junction temperature due to TSV thermal resistance (higher flux + Rth)
+  const l16 = evaluateMemoryPhysics({ ...nandBase, stackLayers: 16, capacityGB: 32 }, BASE_CTX);
+  const l128 = evaluateMemoryPhysics({ ...nandBase, stackLayers: 128, capacityGB: 32 }, BASE_CTX);
+  assert.ok(
+    l128.physics.dieAreaMm2 < l16.physics.dieAreaMm2,
+    `Expected 128L dieArea (${l128.physics.dieAreaMm2}) < 16L (${l16.physics.dieAreaMm2})`
+  );
+  assert.ok(
+    (l128.physics.densityGbitPerMm2 ?? 0) > (l16.physics.densityGbitPerMm2 ?? 0),
+    'Expected 128L areal density > 16L'
+  );
+  assert.ok(
+    l128.physics.junctionTempC > l16.physics.junctionTempC,
+    `Expected 128L Tj (${l128.physics.junctionTempC}°C) > 16L Tj (${l16.physics.junctionTempC}°C) due to TSV thermal stack`
+  );
+});
+
+// ─── TEST 15: Full-stack ecosystem synergy (CPU + GPU + RAM + Storage = 1.68x) & determinism ──
+test('15. Full-stack CPU + GPU + RAM + Storage production yields 1.68x synergy, TB/mo output, and deterministic runs', () => {
+  const base = createInitialState();
+  const cpuChip = base.chips[0];
+  const gpuChip = {
+    ...createStarterGpuDraft(),
+    id: 'prod_gpu_1',
+    status: 'production' as const,
+    processNodeId: 'node_350nm',
+    clockGHz: 0.35,
+    voltageV: 2.5,
+  };
+  const dramChip: MemoryBlueprint = {
+    ...createStarterMemoryDraft(),
+    id: 'prod_dram_1',
+    name: 'MR-16 System RAM',
+    status: 'production',
+    memoryCategory: 'dram',
+    capacityGB: 0.002,
+    stackLayers: 1,
+  };
+  const nandChip: MemoryBlueprint = {
+    ...createStarterMemoryDraft(),
+    id: 'prod_nand_1',
+    name: 'Flash-8 Planar SSD',
+    status: 'production',
+    memoryCategory: 'rom_nand',
+    cellArchId: 'mem_planar_nand',
+    interfaceId: 'iface_onfi_nvme',
+    capacityGB: 0.004,
+    stackLayers: 1,
+    busWidthBits: 16,
+    dataRateMTs: 38,
+    voltageV: 5.0,
+  };
+
+  const extraFabs = ['fab_2', 'fab_3', 'fab_4'].map((id, i) => ({
+    id,
+    kind: 'fab' as const,
+    name: `Expansion Fab ${i + 2}`,
+    level: 2,
+    monthlyUpkeepCR: 180,
+    powerDrawMW: 12,
+    waferCapacityPerMonth: 200,
+    cleanroomGrade: 2,
+    assignedNodeId: 'node_350nm',
+  }));
+
+  const fullStackState: GameState = {
+    ...base,
+    unlockedTechIds: [
+      ...base.unlockedTechIds,
+      'fab_3000nm',
+      'fab_1000nm',
+      'fab_350nm',
+      'gpu_fixed_pipeline',
+      'mem_nand_planar',
+    ],
+    silicon: 500000,
+    facilities: [
+      ...base.facilities.map((f) =>
+        f.kind === 'power_plant'
+          ? { ...f, powerOutputMW: 500 }
+          : f.kind === 'packaging_plant'
+            ? { ...f, packagingCapacityPerMonth: 500000 }
+            : f.kind === 'silicon_refinery'
+              ? { ...f, siliconPerMonth: 500000 }
+              : f
+      ),
+      ...extraFabs,
+    ],
+    chips: [cpuChip, gpuChip, dramChip, nandChip],
+    productionLines: [
+      { ...base.productionLines[0], chipId: cpuChip.id, targetWaferStartsPerMonth: 40 },
+      {
+        id: 'line_2',
+        fabId: 'fab_2',
+        chipId: gpuChip.id,
+        targetWaferStartsPerMonth: 40,
+        actualWaferStartsPerMonth: 0,
+        qaStrictness: 1.0,
+        yieldPercent: 0,
+        goodDiesPerMonth: 0,
+        siliconConsumedPerMonth: 0,
+        powerDrawMW: 0,
+        statusNote: 'Nominal',
+      },
+      {
+        id: 'line_3',
+        fabId: 'fab_3',
+        chipId: dramChip.id,
+        targetWaferStartsPerMonth: 40,
+        actualWaferStartsPerMonth: 0,
+        qaStrictness: 1.0,
+        yieldPercent: 0,
+        goodDiesPerMonth: 0,
+        siliconConsumedPerMonth: 0,
+        powerDrawMW: 0,
+        statusNote: 'Nominal',
+      },
+      {
+        id: 'line_4',
+        fabId: 'fab_4',
+        chipId: nandChip.id,
+        targetWaferStartsPerMonth: 40,
+        actualWaferStartsPerMonth: 0,
+        qaStrictness: 1.0,
+        yieldPercent: 0,
+        goodDiesPerMonth: 0,
+        siliconConsumedPerMonth: 0,
+        powerDrawMW: 0,
+        statusNote: 'Nominal',
+      },
+    ],
+  };
+
+  const computed = recomputeTelemetry(fullStackState, new ChipMetricsCache());
+  assert.equal(computed.telemetry.hasActiveCpu, true);
+  assert.equal(computed.telemetry.hasActiveGpu, true);
+  assert.equal(computed.telemetry.hasActiveMemory, true);
+  assert.equal(computed.telemetry.hasActiveStorage, true);
+  assert.equal(
+    Number(computed.telemetry.activeChipEcosystemBonus.toFixed(2)),
+    1.68,
+    `Expected full-stack synergy 1.68x, got ${computed.telemetry.activeChipEcosystemBonus}`
+  );
+  assert.ok(
+    (computed.telemetry.monthlyMemoryCapacityTB ?? 0) > 0,
+    `Expected monthlyMemoryCapacityTB > 0, got ${computed.telemetry.monthlyMemoryCapacityTB}`
+  );
+
+  const runA = advanceSimulationDays(computed, 45, new ChipMetricsCache()).state;
+  const runB = advanceSimulationDays(computed, 45, new ChipMetricsCache()).state;
+  assert.equal(JSON.stringify(runA), JSON.stringify(runB), 'Full-stack memory simulation must be deterministic');
+});
+
+// ─── TEST 16: Legacy save migration cleanly hydrates memoryDraft & researchBudgets.memory ──
+test('16. migrateGameState upgrades legacy saves missing memoryDraft, researchBudgets.memory, and new telemetry fields', () => {
+  const fresh = createInitialState();
+  const legacyRaw = JSON.parse(JSON.stringify(fresh)) as Record<string, unknown>;
+  delete legacyRaw.memoryDraft;
+  const budgets = legacyRaw.researchBudgets as Record<string, unknown>;
+  delete budgets.memory;
+  const telem = legacyRaw.telemetry as Record<string, unknown>;
+  delete telem.hasActiveMemory;
+  delete telem.hasActiveStorage;
+  delete telem.monthlyMemoryCapacityTB;
+  delete telem.monthlyMemoryDiesByCategory;
+
+  const migrated = recomputeTelemetry(
+    migrateGameState(legacyRaw as unknown as GameState),
+    new ChipMetricsCache()
+  );
+
+  assert.equal(migrated.memoryDraft.kind, 'memory');
+  assert.ok(migrated.researchBudgets.memory > 0, 'Expected default memory research budget');
+  assert.equal(typeof migrated.telemetry.hasActiveMemory, 'boolean');
+  assert.equal(typeof migrated.telemetry.monthlyMemoryCapacityTB, 'number');
+  assert.ok(migrated.telemetry.monthlyMemoryDiesByCategory !== undefined);
 });
 
 console.log(`\nAll ${passed} audit verification tests passed.`);

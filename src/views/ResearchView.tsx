@@ -23,6 +23,7 @@ const CATEGORY_LABELS: Record<TechCategory, string> = {
   fabrication: 'Fabrication',
   cpu: 'CPU Architecture',
   gpu: 'GPU Architecture',
+  memory: 'Memory & Storage',
   support: 'Supporting Tech',
   frontier: 'Frontier Paradigms',
 };
@@ -58,6 +59,7 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
     state.researchBudgets.fabrication +
     state.researchBudgets.cpu +
     state.researchBudgets.gpu +
+    state.researchBudgets.memory +
     state.researchBudgets.support;
 
   return (
@@ -157,7 +159,7 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
             </p>
           </div>
           <div className="space-y-3.5">
-            {(['fabrication', 'cpu', 'gpu', 'support'] as const).map((key) => {
+            {(['fabrication', 'cpu', 'gpu', 'memory', 'support'] as const).map((key) => {
               const raw = state.researchBudgets[key];
               const pct = Math.round((raw / Math.max(1, budgetSum)) * 100);
               return (
@@ -188,7 +190,7 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
             Available Research Projects ({availableTechs.length})
           </h2>
           <div className="flex flex-wrap items-center gap-1 bg-[#0B0F17] border border-[#1F2A3D] rounded-md p-0.5">
-            {(['all', 'fabrication', 'cpu', 'gpu', 'support', 'frontier'] as const).map((cat) => (
+            {(['all', 'fabrication', 'cpu', 'gpu', 'memory', 'support', 'frontier'] as const).map((cat) => (
               <button
                 key={cat}
                 type="button"

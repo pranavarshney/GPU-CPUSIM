@@ -37,6 +37,8 @@ import type {
   GameState,
   GpuBlueprint,
   HistoryPoint,
+  MemoryBlueprint,
+  MemoryCategory,
   MilestoneEvent,
   ProductionLine,
   TechCategory,
@@ -173,6 +175,74 @@ export function createStarterGpuDraft(): GpuBlueprint {
   };
 }
 
+export function createStarterMemoryDraft(): MemoryBlueprint {
+  return {
+    id: 'draft_memory',
+    kind: 'memory',
+    name: 'MR-16 Planar DRAM',
+    revision: 1,
+    status: 'draft',
+    createdYear: 1,
+    memoryCategory: 'dram',
+    processNodeId: 'node_10000nm',
+    transistorStructureId: 'trans_planar',
+    packagingId: 'pkg_dip',
+    cellArchId: 'mem_1t1c_planar',
+    interfaceId: 'iface_async_dram',
+    capacityGB: 0.002,
+    stackLayers: 1,
+    bitsPerCell: 1,
+    dataRateMTs: 38,
+    voltageV: 5.0,
+    busWidthBits: 16,
+    bankCount: 4,
+    eccLevel: 0,
+    powerLimitW: 16,
+    coolingId: 'cool_passive',
+  };
+}
+
+/**
+ * Safely upgrades saved GameState objects from earlier versions that lacked
+ * Memory & Storage fields (memoryDraft, researchBudgets.memory, or extended telemetry).
+ */
+export function migrateGameState(raw: GameState): GameState {
+  const budgets = raw.researchBudgets ?? {
+    fabrication: 30,
+    cpu: 20,
+    gpu: 15,
+    memory: 20,
+    support: 15,
+  };
+  const migratedBudgets: DepartmentBudgets = {
+    fabrication: budgets.fabrication ?? 30,
+    cpu: budgets.cpu ?? 20,
+    gpu: budgets.gpu ?? 15,
+    memory: typeof budgets.memory === 'number' ? budgets.memory : 20,
+    support: budgets.support ?? 15,
+  };
+  const migrated: GameState = {
+    ...raw,
+    memoryDraft: raw.memoryDraft ?? createStarterMemoryDraft(),
+    researchBudgets: migratedBudgets,
+    telemetry: {
+      ...raw.telemetry,
+      hasActiveCpu: raw.telemetry?.hasActiveCpu ?? false,
+      hasActiveGpu: raw.telemetry?.hasActiveGpu ?? false,
+      hasActiveMemory: raw.telemetry?.hasActiveMemory ?? false,
+      hasActiveStorage: raw.telemetry?.hasActiveStorage ?? false,
+      monthlyMemoryDiesByCategory: raw.telemetry?.monthlyMemoryDiesByCategory ?? {
+        dram: 0,
+        vram: 0,
+        rom_nand: 0,
+        storage_class: 0,
+      },
+      monthlyMemoryCapacityTB: raw.telemetry?.monthlyMemoryCapacityTB ?? 0,
+    },
+  };
+  return recomputeTelemetry(migrated, new ChipMetricsCache());
+}
+
 export function createInitialState(): GameState {
   const starterChip: CpuBlueprint = {
     id: 'chip_se100',
@@ -303,6 +373,17 @@ export function createInitialState(): GameState {
       powerDeficit: false,
       packagingStarved: false,
       inDebt: false,
+      hasActiveCpu: true,
+      hasActiveGpu: false,
+      hasActiveMemory: false,
+      hasActiveStorage: false,
+      monthlyMemoryDiesByCategory: {
+        dram: 0,
+        vram: 0,
+        rom_nand: 0,
+        storage_class: 0,
+      },
+      monthlyMemoryCapacityTB: 0,
     },
     unlockedTechIds: [],
     activeResearch: [],
@@ -311,6 +392,7 @@ export function createInitialState(): GameState {
     chips: [starterChip],
     cpuDraft: createStarterCpuDraft(),
     gpuDraft: createStarterGpuDraft(),
+    memoryDraft: createStarterMemoryDraft(),
     facilities,
     productionLines,
     tapeOutQueue: [],
@@ -322,10 +404,11 @@ export function createInitialState(): GameState {
       qa: 5,
     },
     researchBudgets: {
-      fabrication: 35,
-      cpu: 25,
-      gpu: 20,
-      support: 20,
+      fabrication: 30,
+      cpu: 20,
+      gpu: 15,
+      memory: 20,
+      support: 15,
     },
     qaBudgetLevel: 1,
     monthlyHistory: [
@@ -476,7 +559,11 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
       litho.powerOverheadMultiplier *
       metrologyPowerMult;
     const goodDiesAtFull = waferTarget * evalRes.physics.goodDiesPerWafer;
-    const pkgNeeded = goodDiesAtFull * pkg.packagingLoadPerDie;
+    const stackPkgMult =
+      chip.kind === 'memory' && chip.stackLayers > 1
+        ? 1 + 0.15 * Math.log2(chip.stackLayers)
+        : 1.0;
+    const pkgNeeded = goodDiesAtFull * pkg.packagingLoadPerDie * stackPkgMult;
 
     requestedSiPerMonth += siNeeded;
     requestedFabPowerMW += powerMW;
@@ -524,6 +611,15 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
   let actualPkgUsed = 0;
   let hasActiveCpu = false;
   let hasActiveGpu = false;
+  let hasActiveMemory = false;
+  let hasActiveStorage = false;
+  let monthlyMemoryCapacityTB = 0;
+  const monthlyMemoryDiesByCategory: Record<MemoryCategory, number> = {
+    dram: 0,
+    vram: 0,
+    rom_nand: 0,
+    storage_class: 0,
+  };
 
   const updatedLines: ProductionLine[] = state.productionLines.map((line) => {
     const plan = plans.find((p) => p.line.id === line.id);
@@ -550,8 +646,19 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
     actualSiConsumed += siUsed;
     actualFabPowerMW += pwr;
     actualPkgUsed += pkgUsed;
-    if (plan.chip.kind === 'cpu') hasActiveCpu = true;
-    if (plan.chip.kind === 'gpu') hasActiveGpu = true;
+    if (plan.chip.kind === 'cpu') {
+      hasActiveCpu = true;
+    } else if (plan.chip.kind === 'gpu') {
+      hasActiveGpu = true;
+    } else if (plan.chip.kind === 'memory') {
+      monthlyMemoryDiesByCategory[plan.chip.memoryCategory] += goodDies;
+      monthlyMemoryCapacityTB += (goodDies * plan.chip.capacityGB) / 1024;
+      if (plan.chip.memoryCategory === 'dram' || plan.chip.memoryCategory === 'vram') {
+        hasActiveMemory = true;
+      } else {
+        hasActiveStorage = true;
+      }
+    }
 
     let statusNote = 'Nominal';
     if (powerScale < 0.99) statusNote = 'Power Throttled';
@@ -569,8 +676,16 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
     };
   });
 
-  // Ecosystem synergy: supplying both CPUs and GPUs amplifies Civilization Compute Demand
-  const ecosystemBonus = hasActiveCpu && hasActiveGpu ? 1.32 : 1.0;
+  // Full-stack ecosystem synergy:
+  // CPU + GPU = 1.32x; adding active Memory (RAM/VRAM) +0.18; adding active Storage (NAND/SCM) +0.18 (max 1.68x)
+  let ecosystemBonus = hasActiveCpu && hasActiveGpu ? 1.32 : 1.0;
+  if (hasActiveMemory && (hasActiveCpu || hasActiveGpu || hasActiveStorage)) {
+    ecosystemBonus += 0.18;
+  }
+  if (hasActiveStorage && (hasActiveCpu || hasActiveGpu || hasActiveMemory)) {
+    ecosystemBonus += 0.18;
+  }
+  ecosystemBonus = Number(ecosystemBonus.toFixed(2));
 
   // Civilization Compute Index grows smoothly with delivered compute (logarithmic-power balance across millennia)
   const effectiveComputeIndex = Math.max(
@@ -624,6 +739,12 @@ export function recomputeTelemetry(state: GameState, cache: ChipMetricsCache): G
       powerDeficit: totalPowerRequested > powerCapacityMW,
       packagingStarved: packagingScale < 0.99,
       inDebt: state.credits < 0,
+      hasActiveCpu,
+      hasActiveGpu,
+      hasActiveMemory,
+      hasActiveStorage,
+      monthlyMemoryDiesByCategory,
+      monthlyMemoryCapacityTB: Number(monthlyMemoryCapacityTB.toFixed(4)),
     },
   };
 }
@@ -721,6 +842,7 @@ export function advanceSimulationDays(
         state.researchBudgets.fabrication +
         state.researchBudgets.cpu +
         state.researchBudgets.gpu +
+        (state.researchBudgets.memory ?? 0) +
         state.researchBudgets.support;
 
       // Compute relative weight of each active project
@@ -730,8 +852,8 @@ export function advanceSimulationDays(
         const catShare =
           cat === 'frontier'
             ? 25
-            : state.researchBudgets[cat as keyof DepartmentBudgets] ?? 25;
-        return Math.max(5, catShare / Math.max(1, budgetSum) * 100);
+            : state.researchBudgets[cat as keyof DepartmentBudgets] ?? 20;
+        return Math.max(5, (catShare / Math.max(1, budgetSum)) * 100);
       });
       const weightSum = weights.reduce((a, b) => a + b, 0);
 

@@ -73,6 +73,30 @@ const CATEGORY_STYLES: Record<
     text: '#CBD5E1',
     name: 'Uncore Logic',
   },
+  mem_array: {
+    fill: '#0F2E35',
+    stroke: '#14B8A6',
+    text: '#CCFBF1',
+    name: 'Memory Cell Array',
+  },
+  sense_amp: {
+    fill: '#2B2113',
+    stroke: '#D97706',
+    text: '#FDE68A',
+    name: 'Sense Amps & Decoders',
+  },
+  ecc_ctrl: {
+    fill: '#1E2538',
+    stroke: '#818CF8',
+    text: '#E0E7FF',
+    name: 'ECC & Wear Controller',
+  },
+  tsv_phy: {
+    fill: '#0E3A4A',
+    stroke: '#06B6D4',
+    text: '#CFFAFE',
+    name: 'TSV / High-Speed PHY',
+  },
 };
 
 function thermalColorForFlux(fluxWPerMm2: number): { fill: string; stroke: string } {
@@ -228,12 +252,14 @@ export const DieFloorplanSVG: React.FC<DieFloorplanSVGProps> = ({
       {/* Interactive Probe Readout / Legend */}
       <div className="flex items-center justify-between text-xs border-t border-[#1F2A3D] pt-2.5 min-h-[28px]">
         {hovered ? (
-          <div className="flex items-center justify-between w-full font-mono tabular-nums">
-            <span className="text-[#E8EEF7]">
-              {hovered.label} ({CATEGORY_STYLES[hovered.category].name})
+          <div className="flex items-center justify-between w-full gap-2 font-mono tabular-nums">
+            <span className="text-[#E8EEF7] truncate">
+              {hovered.label} · {CATEGORY_STYLES[hovered.category].name}
             </span>
-            <span className="text-[#8C9BB2]">
-              {hovered.areaMm2.toFixed(2)} mm² · {hovered.heatFluxWPerMm2.toFixed(2)} W/mm²
+            <span className="text-[#8C9BB2] shrink-0">
+              {hovered.areaMm2.toFixed(1)} mm² (
+              {((hovered.areaMm2 / Math.max(0.1, physics.dieAreaMm2)) * 100).toFixed(0)}%) ·{' '}
+              {hovered.heatFluxWPerMm2.toFixed(2)} W/mm²
             </span>
           </div>
         ) : thermalOverlay ? (
@@ -242,6 +268,15 @@ export const DieFloorplanSVG: React.FC<DieFloorplanSVGProps> = ({
             <span className="font-mono tabular-nums">
               Avg {physics.heatFluxWPerMm2.toFixed(2)} W/mm² · Tj {physics.junctionTempC.toFixed(1)} °C
             </span>
+          </div>
+        ) : physics.capacityGB !== undefined ? (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[#8C9BB2]">
+            <span>Hover block to inspect</span>
+            <span>·</span>
+            <span className="text-[#2DD4BF]">Cell Array</span>
+            <span className="text-[#FBBF24]">Sense Amps</span>
+            <span className="text-[#818CF8]">ECC</span>
+            <span className="text-[#22D3EE]">I/O PHY</span>
           </div>
         ) : (
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[#8C9BB2]">

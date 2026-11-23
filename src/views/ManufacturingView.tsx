@@ -4,10 +4,12 @@ import {
   getBestLithography,
   getMaxWaferDiameterMm,
   getProcessNode,
+  MEMORY_CATEGORY_META,
   PROCESS_NODES,
 } from '../engine/catalog';
 import { formatCompactNumber } from '../engine/simulation';
 import type { GameState, MainSection } from '../engine/types';
+import { formatMemoryCapacity } from './MemoryArchitectView';
 
 interface ManufacturingViewProps {
   state: GameState;
@@ -98,7 +100,15 @@ export const ManufacturingView: React.FC<ManufacturingViewProps> = ({
             {formatCompactNumber(state.telemetry.packagingCapacityPerMonth, 0)}
             <span className="text-xs font-normal text-[#8C9BB2] ml-1">pkg/mo</span>
           </div>
-          <div className="text-xs text-[#8C9BB2]">2.5D/3D packaging multiplies OSAT load</div>
+          <div className="text-xs text-[#8C9BB2] font-mono tabular-nums">
+            {(() => {
+              const memTB = state.telemetry.monthlyMemoryCapacityTB ?? 0;
+              if (memTB <= 0) return '2.5D/3D & TSV stacking multiplies OSAT load';
+              if (memTB >= 100) return `Memory shipped: ${formatCompactNumber(memTB, 1)} TB/mo`;
+              if (memTB >= 1) return `Memory shipped: ${memTB.toFixed(2)} TB/mo`;
+              return `Memory shipped: ${(memTB * 1024).toFixed(1)} GB/mo`;
+            })()}
+          </div>
         </div>
 
         <div className="bg-[#111622] border border-[#1F2A3D] rounded-lg p-4 space-y-2">
@@ -207,9 +217,13 @@ export const ManufacturingView: React.FC<ManufacturingViewProps> = ({
                     <option value="">— Idle (No Product Assigned) —</option>
                     {productionChips.map((chip) => {
                       const n = getProcessNode(chip.processNodeId);
+                      const label =
+                        chip.kind === 'memory'
+                          ? `[${MEMORY_CATEGORY_META[chip.memoryCategory].shortLabel}] ${chip.name} (${formatMemoryCapacity(chip.capacityGB)}) · ${n.name}`
+                          : `[${chip.kind.toUpperCase()}] ${chip.name} · ${n.name}`;
                       return (
                         <option key={chip.id} value={chip.id}>
-                          [{chip.kind.toUpperCase()}] {chip.name} · {n.name}
+                          {label}
                         </option>
                       );
                     })}
@@ -290,9 +304,19 @@ export const ManufacturingView: React.FC<ManufacturingViewProps> = ({
                 </div>
 
                 {assignedChip && (
-                  <div className="text-[11px] text-[#8C9BB2] font-mono tabular-nums">
-                    Node: {getProcessNode(assignedChip.processNodeId).name} · Actual runs:{' '}
-                    {line.actualWaferStartsPerMonth.toFixed(0)} wfr/mo
+                  <div className="text-[11px] text-[#8C9BB2] font-mono tabular-nums flex flex-wrap items-center justify-between gap-2">
+                    <span>
+                      Node: {getProcessNode(assignedChip.processNodeId).name} · Actual runs:{' '}
+                      {line.actualWaferStartsPerMonth.toFixed(0)} wfr/mo
+                    </span>
+                    {assignedChip.kind === 'memory' && (
+                      <span className="text-[#14B8A6]">
+                        {line.goodDiesPerMonth * assignedChip.capacityGB >= 1024
+                          ? `${((line.goodDiesPerMonth * assignedChip.capacityGB) / 1024).toFixed(2)} TB/mo`
+                          : `${(line.goodDiesPerMonth * assignedChip.capacityGB).toFixed(1)} GB/mo`}{' '}
+                        · {assignedChip.stackLayers}L Stack
+                      </span>
+                    )}
                   </div>
                 )}
               </div>
