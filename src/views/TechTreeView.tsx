@@ -31,6 +31,8 @@ interface TechTreeViewProps {
   state: GameState;
   onStartResearch: (techId: string) => void;
   onCancelResearch: (techId: string) => void;
+  focusTechId?: string | null;
+  onFocusConsumed?: () => void;
 }
 
 type StatusFilter = 'all' | 'available' | 'unlocked' | 'locked';
@@ -106,6 +108,8 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
   state,
   onStartResearch,
   onCancelResearch,
+  focusTechId,
+  onFocusConsumed,
 }) => {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const minimapRef = useRef<SVGSVGElement | null>(null);
@@ -210,6 +214,18 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
     },
     [zoom, viewportSize.width, viewportSize.height]
   );
+
+  // Jump directly to a specific tech node when navigated from Command Palette or Architect hints
+  useEffect(() => {
+    if (!focusTechId) return;
+    const target = STATIC_NODE_MAP.get(focusTechId);
+    if (target) {
+      setFilterLane('all');
+      setStatusFilter('all');
+      focusOnNode(target, 0.85);
+    }
+    onFocusConsumed?.();
+  }, [focusTechId, focusOnNode, onFocusConsumed]);
 
   const focusOnLane = useCallback(
     (laneId: 'all' | TechLaneId) => {

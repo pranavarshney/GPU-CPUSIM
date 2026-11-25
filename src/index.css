@@ -6,16 +6,17 @@
   --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, "Liberation Mono", Menlo, Monaco, monospace;
 
-  --color-obsidian: #07090E;
-  --color-canvas: #0B0F17;
-  --color-surface: #111622;
-  --color-surface-elevated: #171E2E;
-  --color-hairline: #1F2A3D;
+  --color-obsidian: #06080D;
+  --color-canvas: #0A0E16;
+  --color-surface: #101521;
+  --color-surface-elevated: #161D2D;
+  --color-hairline: #1E293B;
   --color-hairline-strong: #2C3B55;
   --color-ink: #E8EEF7;
   --color-ink-muted: #8C9BB2;
   --color-litho: #06B6D4;
   --color-copper: #D97706;
+  --color-signal-teal: #14B8A6;
 }
 
 @layer base {
@@ -23,10 +24,12 @@
   body,
   #root {
     height: 100%;
-    background-color: #07090E;
+    background-color: #06080D;
     color: #E8EEF7;
     font-family: var(--font-sans);
     letter-spacing: 0.005em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
   h1,
@@ -36,10 +39,35 @@
     font-family: var(--font-display);
     text-wrap: balance;
   }
+
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: 1px solid #06B6D4;
+    outline-offset: 1px;
+  }
 }
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
+}
+
+/* Precision CAD cleanroom dot-grid backdrop for visualizers */
+.foundry-grid-bg {
+  background-color: #06080D;
+  background-image: radial-gradient(rgba(30, 41, 59, 0.72) 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+
+/* Clean custom select dropdowns */
+select.foundry-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238C9BB2' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.65rem center;
+  padding-right: 2rem;
 }
 
 /* Precision engineering range inputs */
@@ -48,16 +76,22 @@ input[type="range"].foundry-slider {
   appearance: none;
   width: 100%;
   height: 4px;
-  background: #1F2A3D;
+  background: transparent;
   border-radius: 2px;
   outline: none;
+}
+
+input[type="range"].foundry-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
 }
 
 input[type="range"].foundry-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
+  margin-top: -4.5px;
   border-radius: 2px;
   background: #06B6D4;
   border: 1px solid #67E8F9;
@@ -66,7 +100,7 @@ input[type="range"].foundry-slider::-webkit-slider-thumb {
 }
 
 input[type="range"].foundry-slider::-webkit-slider-thumb:hover {
-  transform: scale(1.12);
+  transform: scale(1.14);
   background: #22D3EE;
 }
 
@@ -77,12 +111,30 @@ input[type="range"].foundry-slider:disabled::-webkit-slider-thumb {
 }
 
 input[type="range"].foundry-slider::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
   border-radius: 2px;
   background: #06B6D4;
   border: 1px solid #67E8F9;
   cursor: pointer;
+}
+
+/* Fallback track when slider is used standalone without PrecisionSlider wrapper */
+input[type="range"].foundry-slider:not([data-custom-track="true"]) {
+  background: #1E293B;
+}
+
+/* Compact density adjustment */
+[data-density="compact"] main {
+  font-size: 0.94em;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
 
 /* Subtle dark scrollbars */
@@ -91,10 +143,10 @@ input[type="range"].foundry-slider::-moz-range-thumb {
   height: 7px;
 }
 ::-webkit-scrollbar-track {
-  background: #0B0F17;
+  background: #0A0E16;
 }
 ::-webkit-scrollbar-thumb {
-  background: #1F2A3D;
+  background: #1E293B;
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {

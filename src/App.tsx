@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { CommandPalette } from './components/CommandPalette';
 import { PhysicsReferenceModal } from './components/PhysicsReferenceModal';
 import { SaveLoadModal } from './components/SaveLoadModal';
+import { SettingsModal } from './components/SettingsModal';
 import { Sidebar } from './components/Sidebar';
+import { ToastStack, type ToastItem } from './components/ToastStack';
 import { TopCommandBar } from './components/TopCommandBar';
+import { bumpRevisionName } from './engine/architectHelpers';
 import { ChipMetricsCache } from './engine/physics';
 import {
   adjustDepartmentStaff,
@@ -16,6 +20,7 @@ import {
   queueFacilityBuild,
   queueFacilityUpgrade,
   recomputeTelemetry,
+  renameCompany,
   setDepartmentBudgets,
   setQaBudget,
   startChipTapeOut,
@@ -25,6 +30,7 @@ import {
   loadLatestSaveIfAny,
   loadUiSettings,
   saveQuarterlyAutosave,
+  saveToSlot,
   saveUiSettings,
 } from './engine/storage';
 import type {
@@ -37,6 +43,7 @@ import type {
   GpuBlueprint,
   MainSection,
   MemoryBlueprint,
+  MilestoneEvent,
   SimulationSpeed,
   UiSettings,
 } from './engine/types';
@@ -59,20 +66,98 @@ const DAYS_PER_SECOND: Record<SimulationSpeed, number> = {
   10: 45.0,
 };
 
+const ALT_SECTION_SHORTCUTS: Record<string, MainSection> = {
+  '1': 'overview',
+  '2': 'research',
+  '3': 'tech_tree',
+  '4': 'cpu_architect',
+  '5': 'gpu_architect',
+  '6': 'memory_architect',
+  '7': 'manufacturing',
+  '8': 'testing',
+  '9': 'infrastructure',
+  '0': 'finances',
+};
+
+function actionForCategory(category: MilestoneEvent['category']): {
+  section: MainSection;
+  label: string;
+  tone: ToastItem['tone'];
+} {
+  switch (category) {
+    case 'research':
+      return { section: 'research', label: 'Open Research', tone: 'info' };
+    case 'tapeout':
+      return { section: 'manufacturing', label: 'Assign to Fab', tone: 'nominal' };
+    case 'construction':
+      return { section: 'infrastructure', label: 'View Facilities', tone: 'nominal' };
+    case 'warning':
+      return { section: 'finances', label: 'Inspect Operations', tone: 'warning' };
+    default:
+      return { section: 'overview', label: 'View Overview', tone: 'info' };
+  }
+}
+
 export default function App() {
   const cacheRef = useRef<ChipMetricsCache>(new ChipMetricsCache());
   const [state, setState] = useState<GameState>(() => createInitialState());
   const [activeSection, setActiveSection] = useState<MainSection>('overview');
   const [testingSelectedId, setTestingSelectedId] = useState<string | undefined>(undefined);
+  const [focusTechId, setFocusTechId] = useState<string | null>(null);
   const [uiSettings, setUiSettings] = useState<UiSettings>(() => loadUiSettings());
+
+  // Modals & drawers
   const [showSaveModal, setShowSaveModal] = useState(false);
   const [showPhysicsModal, setShowPhysicsModal] = useState(false);
+  const [showCommandPalette, setShowCommandPalette] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
   const [autosaveNotice, setAutosaveNotice] = useState<string | null>(null);
-  const [toast, setToast] = useState<{ title: string; detail: string } | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   const lastNonZeroSpeedRef = useRef<SimulationSpeed>(1);
   const uiSettingsRef = useRef<UiSettings>(uiSettings);
   uiSettingsRef.current = uiSettings;
+  const stateRef = useRef<GameState>(state);
+  stateRef.current = state;
+
+  const toastTimersRef = useRef<Map<string, number>>(new Map());
+
+  const dismissToast = useCallback((id: string) => {
+    const timer = toastTimersRef.current.get(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      toastTimersRef.current.delete(id);
+    }
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const pushToast = useCallback(
+    (item: ToastItem) => {
+      setToasts((prev) => {
+        if (prev.some((t) => t.id === item.id)) return prev;
+        return [item, ...prev].slice(0, 3);
+      });
+      if (!toastTimersRef.current.has(item.id)) {
+        const timer = window.setTimeout(() => {
+          toastTimersRef.current.delete(item.id);
+          setToasts((prev) => prev.filter((t) => t.id !== item.id));
+        }, 5200);
+        toastTimersRef.current.set(item.id, timer);
+      }
+    },
+    []
+  );
+
+  // Clean up pending toast timers on unmount
+  useEffect(() => {
+    const timers = toastTimersRef.current;
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+      timers.clear();
+    };
+  }, []);
 
   // Attempt to restore most recent IndexedDB save on startup
   useEffect(() => {
@@ -86,7 +171,7 @@ export default function App() {
         );
         setState(refreshed);
         setAutosaveNotice('Restored last session (Paused)');
-        setTimeout(() => setAutosaveNotice(null), 4000);
+        window.setTimeout(() => setAutosaveNotice(null), 4000);
       }
     });
     return () => {
@@ -99,15 +184,9 @@ export default function App() {
     saveUiSettings(uiSettings);
   }, [uiSettings]);
 
-  const showToast = useCallback((title: string, detail: string) => {
-    setToast({ title, detail });
+  const handleUpdateUiSettings = useCallback((patch: Partial<UiSettings>) => {
+    setUiSettings((prev) => ({ ...prev, ...patch }));
   }, []);
-
-  useEffect(() => {
-    if (!toast) return;
-    const id = setTimeout(() => setToast(null), 4500);
-    return () => clearTimeout(id);
-  }, [toast]);
 
   // EU4-Style Real-Time Simulation Loop with Multi-Day Batching for 10x Multi-Millennia Performance
   const speed = state.speed;
@@ -131,14 +210,75 @@ export default function App() {
           if (prev.speed === 0) return prev;
           const res = advanceSimulationDays(prev, wholeDays, cacheRef.current);
           let nextState = res.state;
+          const settings = uiSettingsRef.current;
+          const cats = res.triggeredCategories ?? [];
 
-          if (res.milestoneTriggered) {
-            const latest = nextState.events[0];
-            if (latest) {
-              showToast(latest.title, latest.detail);
+          // Granular auto-pause rules
+          let shouldPause = false;
+          if (res.milestoneTriggered && settings.pauseOnMilestone) {
+            if (cats.includes('research') && (settings.pauseOnResearch ?? true)) {
+              shouldPause = true;
             }
-            if (uiSettingsRef.current.pauseOnMilestone) {
-              nextState = { ...nextState, speed: 0 };
+            if (cats.includes('tapeout') && (settings.pauseOnTapeOut ?? true)) {
+              shouldPause = true;
+            }
+            if (cats.includes('construction') && (settings.pauseOnConstruction ?? false)) {
+              shouldPause = true;
+            }
+            if (cats.includes('milestone')) {
+              shouldPause = true;
+            }
+          }
+          if (res.enteredDebt && (settings.pauseOnDebt ?? true)) {
+            shouldPause = true;
+          }
+          if (res.enteredStarvation && (settings.pauseOnStarvation ?? false)) {
+            shouldPause = true;
+          }
+
+          if (shouldPause) {
+            nextState = { ...nextState, speed: 0 };
+          }
+
+          // Actionable toast notifications (queued outside updater cleanly via microtask)
+          if (res.milestoneTriggered || res.enteredDebt || res.enteredStarvation) {
+            const latest = nextState.events[0];
+            if (res.enteredDebt) {
+              queueMicrotask(() => {
+                pushToast({
+                  id: `debt-${nextState.clock.totalDays}`,
+                  title: 'Operating Credit Deficit',
+                  detail:
+                    'Treasury fell below zero. Review opex, staffing, or assign profitable silicon lines.',
+                  tone: 'critical',
+                  actionSection: 'finances',
+                  actionLabel: 'Open Finances',
+                });
+              });
+            } else if (res.enteredStarvation) {
+              queueMicrotask(() => {
+                pushToast({
+                  id: `starve-${nextState.clock.totalDays}`,
+                  title: 'Foundry Supply Bottleneck',
+                  detail:
+                    'Production lines are throttled by raw silicon, power, or packaging capacity.',
+                  tone: 'warning',
+                  actionSection: 'infrastructure',
+                  actionLabel: 'Expand Infra',
+                });
+              });
+            } else if (latest) {
+              const meta = actionForCategory(latest.category);
+              queueMicrotask(() => {
+                pushToast({
+                  id: latest.id,
+                  title: latest.title,
+                  detail: latest.detail,
+                  tone: meta.tone,
+                  actionSection: meta.section,
+                  actionLabel: meta.label,
+                });
+              });
             }
           }
 
@@ -148,7 +288,7 @@ export default function App() {
                 setAutosaveNotice(
                   `Autosaved Y${String(nextState.clock.year).padStart(4, '0')}`
                 );
-                setTimeout(() => setAutosaveNotice(null), 3000);
+                window.setTimeout(() => setAutosaveNotice(null), 3000);
               })
               .catch(() => undefined);
           }
@@ -162,9 +302,8 @@ export default function App() {
 
     rafId = requestAnimationFrame(frame);
     return () => cancelAnimationFrame(rafId);
-  }, [speed, showToast]);
+  }, [speed, pushToast]);
 
-  // Keyboard shortcuts (Space = Pause/Resume, 1..4 = Speed 1x/2x/5x/10x)
   const handleSetSpeed = useCallback((nextSpeed: SimulationSpeed) => {
     if (nextSpeed !== 0) {
       lastNonZeroSpeedRef.current = nextSpeed;
@@ -172,17 +311,101 @@ export default function App() {
     setState((prev) => ({ ...prev, speed: nextSpeed }));
   }, []);
 
+  const handleQuickSave = useCallback(() => {
+    const current = stateRef.current;
+    const label = `Quick Save · Y${String(current.clock.year).padStart(4, '0')}`;
+    saveToSlot('slot-1', label, current, false)
+      .then(() => {
+        setAutosaveNotice(`Quick-saved Slot 1 (Y${String(current.clock.year).padStart(4, '0')})`);
+        window.setTimeout(() => setAutosaveNotice(null), 3200);
+        pushToast({
+          id: `quicksave-${Date.now()}`,
+          title: 'Quick Save Complete',
+          detail: `Saved campaign snapshot to Manual Slot 1 (${label}).`,
+          tone: 'nominal',
+        });
+      })
+      .catch(() => {
+        pushToast({
+          id: `quicksave-err-${Date.now()}`,
+          title: 'Quick Save Warning',
+          detail: 'Browser storage restricted; export a JSON backup from Save / Load.',
+          tone: 'warning',
+        });
+      });
+  }, [pushToast]);
+
+  // Global keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+
+      // Ctrl/Cmd + K -> Command Palette (works even while focused in inputs)
+      if ((e.ctrlKey || e.metaKey) && key === 'k') {
+        e.preventDefault();
+        setShowCommandPalette((v) => !v);
+        return;
+      }
+
+      // Ctrl/Cmd + S -> Quick Save to Slot 1
+      if ((e.ctrlKey || e.metaKey) && key === 's') {
+        e.preventDefault();
+        handleQuickSave();
+        return;
+      }
+
+      // Escape closes topmost modal or drawer
+      if (e.key === 'Escape') {
+        if (showCommandPalette) {
+          setShowCommandPalette(false);
+          return;
+        }
+        if (showSettingsModal) {
+          setShowSettingsModal(false);
+          return;
+        }
+        if (showSaveModal) {
+          setShowSaveModal(false);
+          return;
+        }
+        if (showPhysicsModal) {
+          setShowPhysicsModal(false);
+          return;
+        }
+        if (mobileNavOpen) {
+          setMobileNavOpen(false);
+          return;
+        }
+      }
+
+      // Alt + 1..9, 0 -> Direct workspace navigation
+      if (e.altKey && !e.ctrlKey && !e.metaKey && ALT_SECTION_SHORTCUTS[e.key]) {
+        e.preventDefault();
+        setActiveSection(ALT_SECTION_SHORTCUTS[e.key]);
+        return;
+      }
+
+      // Skip single-key shortcuts when typing or when modal is open
       const target = e.target as HTMLElement | null;
       if (
         target &&
         (target.tagName === 'INPUT' ||
           target.tagName === 'TEXTAREA' ||
-          target.tagName === 'SELECT')
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
       ) {
         return;
       }
+      if (showCommandPalette || showSettingsModal || showSaveModal || showPhysicsModal) {
+        return;
+      }
+
+      if (e.key === '?') {
+        e.preventDefault();
+        setShowSettingsModal(true);
+        return;
+      }
+
       if (e.code === 'Space') {
         e.preventDefault();
         setState((prev) => ({
@@ -201,7 +424,15 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleSetSpeed]);
+  }, [
+    handleSetSpeed,
+    handleQuickSave,
+    showCommandPalette,
+    showSettingsModal,
+    showSaveModal,
+    showPhysicsModal,
+    mobileNavOpen,
+  ]);
 
   // ─── PURE STATE ACTION WRAPPERS ───────────────────────────────────────────
 
@@ -234,10 +465,10 @@ export default function App() {
   }, []);
 
   const handleStartTapeOut = useCallback(
-    (draft: ChipBlueprint): { error?: string } => {
+    (draft: ChipBlueprint, autoAssignLineId?: string): { error?: string } => {
       let errorOut: string | undefined;
       setState((prev) => {
-        const res = startChipTapeOut(prev, draft, cacheRef.current);
+        const res = startChipTapeOut(prev, draft, cacheRef.current, autoAssignLineId);
         errorOut = res.error;
         return res.state;
       });
@@ -288,7 +519,22 @@ export default function App() {
     setState((prev) => archiveChipBlueprint(prev, chipId, cacheRef.current));
   }, []);
 
+  const handleRenameCompany = useCallback((nextName: string) => {
+    setState((prev) => renameCompany(prev, nextName));
+  }, []);
+
+  const handleJumpToTech = useCallback((techId: string) => {
+    setFocusTechId(techId);
+    setActiveSection('tech_tree');
+  }, []);
+
+  const handleInspectChip = useCallback((chipId: string) => {
+    setTestingSelectedId(chipId);
+    setActiveSection('testing');
+  }, []);
+
   const handleLoadChipIntoArchitect = useCallback((chip: ChipBlueprint) => {
+    const nextName = bumpRevisionName(chip.name);
     if (chip.kind === 'cpu') {
       setState((prev) => ({
         ...prev,
@@ -296,7 +542,7 @@ export default function App() {
           ...chip,
           id: 'draft_cpu',
           status: 'draft',
-          name: `${chip.name} Rev 2`,
+          name: nextName,
           revision: prev.cpuDraft.revision + 1,
         },
       }));
@@ -308,7 +554,7 @@ export default function App() {
           ...chip,
           id: 'draft_gpu',
           status: 'draft',
-          name: `${chip.name} Rev 2`,
+          name: nextName,
           revision: prev.gpuDraft.revision + 1,
         },
       }));
@@ -320,7 +566,7 @@ export default function App() {
           ...chip,
           id: 'draft_memory',
           status: 'draft',
-          name: `${chip.name} Rev 2`,
+          name: nextName,
           revision: prev.memoryDraft.revision + 1,
         },
       }));
@@ -332,7 +578,7 @@ export default function App() {
     cacheRef.current.clear();
     setState(recomputeTelemetry(migrateGameState({ ...loaded, speed: 0 }), cacheRef.current));
     setAutosaveNotice(notice);
-    setTimeout(() => setAutosaveNotice(null), 4000);
+    window.setTimeout(() => setAutosaveNotice(null), 4000);
   }, []);
 
   const handleResetGame = useCallback(() => {
@@ -340,33 +586,43 @@ export default function App() {
     setState(createInitialState());
     setActiveSection('overview');
     setAutosaveNotice('New campaign initialized (Year 0001)');
-    setTimeout(() => setAutosaveNotice(null), 4000);
+    window.setTimeout(() => setAutosaveNotice(null), 4000);
   }, []);
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-[#07090E] text-[#E8EEF7] flex">
-      {/* Left Navigation Sidebar */}
+    <div
+      data-density={uiSettings.compactDensity ? 'compact' : 'comfortable'}
+      className="h-screen w-screen overflow-hidden bg-[#06080D] text-[#E8EEF7] flex"
+    >
+      {/* Left Navigation Sidebar (Desktop Rail + Mobile Drawer) */}
       <Sidebar
         activeSection={activeSection}
         state={state}
+        collapsed={Boolean(uiSettings.sidebarCollapsed)}
+        mobileOpen={mobileNavOpen}
+        onToggleCollapse={() =>
+          handleUpdateUiSettings({ sidebarCollapsed: !uiSettings.sidebarCollapsed })
+        }
+        onCloseMobile={() => setMobileNavOpen(false)}
         onSelectSection={setActiveSection}
         onOpenPhysicsRef={() => setShowPhysicsModal(true)}
       />
 
-      {/* Right Main Column: Top EU4 Command Bar + Active Workspace */}
+      {/* Right Main Column: Top Command Bar + Active Workspace */}
       <div className="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
         <TopCommandBar
           state={state}
-          uiSettings={uiSettings}
           onSetSpeed={handleSetSpeed}
-          onTogglePauseOnMilestone={() =>
-            setUiSettings((s) => ({ ...s, pauseOnMilestone: !s.pauseOnMilestone }))
-          }
+          onNavigate={setActiveSection}
+          onQuickSave={handleQuickSave}
           onOpenSaveModal={() => setShowSaveModal(true)}
+          onOpenCommandPalette={() => setShowCommandPalette(true)}
+          onOpenSettings={() => setShowSettingsModal(true)}
+          onOpenMobileMenu={() => setMobileNavOpen(true)}
           autosaveNotice={autosaveNotice}
         />
 
-        <main className="flex-1 overflow-y-auto bg-[#07090E] relative">
+        <main className="flex-1 overflow-y-auto bg-[#06080D] relative">
           {activeSection === 'overview' && (
             <OverviewView state={state} onNavigate={setActiveSection} />
           )}
@@ -387,10 +643,9 @@ export default function App() {
               state={state}
               thermalOverlay={uiSettings.thermalOverlayDefault}
               onToggleThermal={() =>
-                setUiSettings((s) => ({
-                  ...s,
-                  thermalOverlayDefault: !s.thermalOverlayDefault,
-                }))
+                handleUpdateUiSettings({
+                  thermalOverlayDefault: !uiSettings.thermalOverlayDefault,
+                })
               }
               onUpdateDraft={handleUpdateCpuDraft}
               onStartTapeOut={handleStartTapeOut}
@@ -398,6 +653,7 @@ export default function App() {
                 setTestingSelectedId('draft_cpu');
                 setActiveSection('testing');
               }}
+              onJumpToTech={handleJumpToTech}
             />
           )}
 
@@ -406,10 +662,9 @@ export default function App() {
               state={state}
               thermalOverlay={uiSettings.thermalOverlayDefault}
               onToggleThermal={() =>
-                setUiSettings((s) => ({
-                  ...s,
-                  thermalOverlayDefault: !s.thermalOverlayDefault,
-                }))
+                handleUpdateUiSettings({
+                  thermalOverlayDefault: !uiSettings.thermalOverlayDefault,
+                })
               }
               onUpdateDraft={handleUpdateGpuDraft}
               onStartTapeOut={handleStartTapeOut}
@@ -421,6 +676,7 @@ export default function App() {
                 handleStartResearch('gpu_fixed_pipeline');
                 setActiveSection('research');
               }}
+              onJumpToTech={handleJumpToTech}
             />
           )}
 
@@ -429,10 +685,9 @@ export default function App() {
               state={state}
               thermalOverlay={uiSettings.thermalOverlayDefault}
               onToggleThermal={() =>
-                setUiSettings((s) => ({
-                  ...s,
-                  thermalOverlayDefault: !s.thermalOverlayDefault,
-                }))
+                handleUpdateUiSettings({
+                  thermalOverlayDefault: !uiSettings.thermalOverlayDefault,
+                })
               }
               onUpdateDraft={handleUpdateMemoryDraft}
               onStartTapeOut={handleStartTapeOut}
@@ -445,6 +700,7 @@ export default function App() {
                 setActiveSection('research');
               }}
               onJumpToTechTree={() => setActiveSection('tech_tree')}
+              onJumpToTech={handleJumpToTech}
             />
           )}
 
@@ -483,20 +739,44 @@ export default function App() {
               state={state}
               onStartResearch={handleStartResearch}
               onCancelResearch={handleCancelResearch}
+              focusTechId={focusTechId}
+              onFocusConsumed={() => setFocusTechId(null)}
             />
           )}
         </main>
       </div>
 
-      {/* Milestone Notification Toast */}
-      {toast && (
-        <div className="fixed bottom-5 right-5 z-40 max-w-sm bg-[#111622] border border-[#06B6D4]/60 rounded-lg px-4 py-3 shadow-lg">
-          <div className="text-xs font-semibold text-[#22D3EE]">{toast.title}</div>
-          <div className="text-xs text-[#CBD5E1] mt-0.5 leading-relaxed">{toast.detail}</div>
-        </div>
-      )}
+      {/* Stackable Actionable Toast Notifications */}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} onNavigate={setActiveSection} />
 
       {/* Modals */}
+      {showCommandPalette && (
+        <CommandPalette
+          state={state}
+          onClose={() => setShowCommandPalette(false)}
+          onNavigate={setActiveSection}
+          onJumpToTech={handleJumpToTech}
+          onStartResearch={handleStartResearch}
+          onInspectChip={handleInspectChip}
+          onCloneChip={handleLoadChipIntoArchitect}
+          onSetSpeed={handleSetSpeed}
+          onQuickSave={handleQuickSave}
+          onOpenSaveModal={() => setShowSaveModal(true)}
+          onOpenSettings={() => setShowSettingsModal(true)}
+          onOpenPhysicsRef={() => setShowPhysicsModal(true)}
+        />
+      )}
+
+      {showSettingsModal && (
+        <SettingsModal
+          settings={uiSettings}
+          companyName={state.companyName}
+          onUpdateSettings={handleUpdateUiSettings}
+          onRenameCompany={handleRenameCompany}
+          onClose={() => setShowSettingsModal(false)}
+        />
+      )}
+
       {showSaveModal && (
         <SaveLoadModal
           state={state}

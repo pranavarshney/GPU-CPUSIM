@@ -227,6 +227,14 @@ const DEFAULT_UI_SETTINGS: UiSettings = {
   pauseOnMilestone: true,
   thermalOverlayDefault: false,
   showEquationsBanner: false,
+  pauseOnResearch: true,
+  pauseOnTapeOut: true,
+  pauseOnConstruction: false,
+  pauseOnDebt: true,
+  pauseOnStarvation: false,
+  compactDensity: false,
+  sidebarCollapsed: false,
+  numberFormat: 'compact',
 };
 
 export function loadUiSettings(): UiSettings {
@@ -237,11 +245,12 @@ export function loadUiSettings(): UiSettings {
     const raw = localStorage.getItem(UI_SETTINGS_KEY);
     if (!raw) return memoryUiSettings ?? DEFAULT_UI_SETTINGS;
     const parsed = JSON.parse(raw);
+    const legacyPause =
+      typeof parsed.pauseOnMilestone === 'boolean'
+        ? parsed.pauseOnMilestone
+        : DEFAULT_UI_SETTINGS.pauseOnMilestone;
     const hydrated: UiSettings = {
-      pauseOnMilestone:
-        typeof parsed.pauseOnMilestone === 'boolean'
-          ? parsed.pauseOnMilestone
-          : DEFAULT_UI_SETTINGS.pauseOnMilestone,
+      pauseOnMilestone: legacyPause,
       thermalOverlayDefault:
         typeof parsed.thermalOverlayDefault === 'boolean'
           ? parsed.thermalOverlayDefault
@@ -250,6 +259,32 @@ export function loadUiSettings(): UiSettings {
         typeof parsed.showEquationsBanner === 'boolean'
           ? parsed.showEquationsBanner
           : DEFAULT_UI_SETTINGS.showEquationsBanner,
+      pauseOnResearch:
+        typeof parsed.pauseOnResearch === 'boolean' ? parsed.pauseOnResearch : legacyPause,
+      pauseOnTapeOut:
+        typeof parsed.pauseOnTapeOut === 'boolean' ? parsed.pauseOnTapeOut : legacyPause,
+      pauseOnConstruction:
+        typeof parsed.pauseOnConstruction === 'boolean'
+          ? parsed.pauseOnConstruction
+          : DEFAULT_UI_SETTINGS.pauseOnConstruction,
+      pauseOnDebt:
+        typeof parsed.pauseOnDebt === 'boolean' ? parsed.pauseOnDebt : DEFAULT_UI_SETTINGS.pauseOnDebt,
+      pauseOnStarvation:
+        typeof parsed.pauseOnStarvation === 'boolean'
+          ? parsed.pauseOnStarvation
+          : DEFAULT_UI_SETTINGS.pauseOnStarvation,
+      compactDensity:
+        typeof parsed.compactDensity === 'boolean'
+          ? parsed.compactDensity
+          : DEFAULT_UI_SETTINGS.compactDensity,
+      sidebarCollapsed:
+        typeof parsed.sidebarCollapsed === 'boolean'
+          ? parsed.sidebarCollapsed
+          : DEFAULT_UI_SETTINGS.sidebarCollapsed,
+      numberFormat:
+        parsed.numberFormat === 'scientific' || parsed.numberFormat === 'compact'
+          ? parsed.numberFormat
+          : DEFAULT_UI_SETTINGS.numberFormat,
     };
     memoryUiSettings = hydrated;
     return hydrated;

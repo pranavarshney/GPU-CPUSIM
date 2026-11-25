@@ -1,6 +1,19 @@
 import React, { useMemo, useState } from 'react';
-import { AlertTriangle, CheckCircle2, Gauge, Layers, Play } from 'lucide-react';
-import { DieFloorplanSVG } from '../components/DieFloorplanSVG';
+import {
+  ArchitectStudioShell,
+  formatDelta,
+  type TelemetryMetricRow,
+} from '../components/ArchitectStudioShell';
+import { AccordionSection } from '../components/ui/AccordionSection';
+import { PrecisionSlider } from '../components/ui/PrecisionSlider';
+import {
+  applyCpuPreset,
+  generateSmartChipName,
+  getNextUnlockHints,
+  optimizeCpuDraft,
+  type ArchitectPresetId,
+  type OptimizeActionId,
+} from '../engine/architectHelpers';
 import {
   COOLING_SPECS,
   CPU_ARCHITECTURES,
@@ -22,16 +35,18 @@ import {
   getCpuSliderBounds,
   getStabilizedVoltageV,
 } from '../engine/physics';
-import { buildPreviewPhysicsContext, formatCompactNumber } from '../engine/simulation';
+import { buildPreviewPhysicsContext, createStarterCpuDraft } from '../engine/simulation';
 import type { CpuBlueprint, GameState } from '../engine/types';
+import { useDraftHistory } from '../hooks/useDraftHistory';
 
 interface CpuArchitectViewProps {
   state: GameState;
   thermalOverlay: boolean;
   onToggleThermal: () => void;
   onUpdateDraft: (next: CpuBlueprint) => void;
-  onStartTapeOut: (draft: CpuBlueprint) => { error?: string };
+  onStartTapeOut: (draft: CpuBlueprint, autoAssignLineId?: string) => { error?: string };
   onTestPrototype: () => void;
+  onJumpToTech?: (techId: string) => void;
 }
 
 export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
@@ -41,10 +56,20 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
   onUpdateDraft,
   onStartTapeOut,
   onTestPrototype,
+  onJumpToTech,
 }) => {
   const [feedback, setFeedback] = useState<{ type: 'error' | 'ok'; msg: string } | null>(null);
+  const [baselineChipId, setBaselineChipId] = useState<string>('');
   const draft = state.cpuDraft;
   const unlocked = state.unlockedTechIds;
+
+  const { pushAndApply, undo, redo, canUndo, canRedo } = useDraftHistory<CpuBlueprint>(
+    draft,
+    (next) => {
+      setFeedback(null);
+      onUpdateDraft({ ...next, revision: draft.revision + 1 });
+    }
+  );
 
   const unlockedNodes = PROCESS_NODES.filter(
     (n) => !n.requiredTechId || unlocked.includes(n.requiredTechId)
@@ -72,7 +97,6 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
   const maxPcieGen = getMaxPcieGen(unlocked);
   const currentNode = getProcessNode(draft.processNodeId);
   const currentArch = getCpuArch(draft.architectureId);
-
   const sliderBounds = getCpuSliderBounds(draft);
 
   const evaluation = useMemo(() => {
@@ -80,39 +104,32 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
     return evaluateCpuPhysics(draft, ctx);
   }, [draft, state]);
 
+  const cpuChips = useMemo(
+    () => state.chips.filter((c): c is CpuBlueprint => c.kind === 'cpu'),
+    [state.chips]
+  );
+
+  const baselineEval = useMemo(() => {
+    const base = cpuChips.find((c) => c.id === baselineChipId);
+    if (!base) return undefined;
+    const ctx = buildPreviewPhysicsContext(state, base.processNodeId, 1.0);
+    return evaluateCpuPhysics(base, ctx);
+  }, [cpuChips, baselineChipId, state]);
+
+  const nextUnlockHints = useMemo(() => getNextUnlockHints('cpu', unlocked), [unlocked]);
+
   const { physics, benchmarks } = evaluation;
 
   const patch = (partial: Partial<CpuBlueprint>) => {
-    setFeedback(null);
-    onUpdateDraft({
-      ...draft,
-      ...partial,
-      revision: draft.revision + 1,
-    });
+    pushAndApply({ ...draft, ...partial });
   };
 
   const commitDraft = (next: CpuBlueprint) => {
-    setFeedback(null);
-    onUpdateDraft({
-      ...next,
-      revision: draft.revision + 1,
-    });
-  };
-
-  const handleNodeChange = (nodeId: string) => {
-    commitDraft(applyCpuNodeChange(draft, nodeId));
-  };
-
-  const handleArchChange = (archId: string) => {
-    commitDraft(applyCpuArchChange(draft, archId));
-  };
-
-  const handleTransistorChange = (transId: string) => {
-    commitDraft(applyCpuTransistorChange(draft, transId));
+    pushAndApply(next);
   };
 
   const toggleIsa = (isaId: string) => {
-    if (isaId === 'isa_int') return; // Base integer ISA always present
+    if (isaId === 'isa_int') return;
     const exists = draft.isaExtensions.includes(isaId);
     patch({
       isaExtensions: exists
@@ -121,619 +138,498 @@ export const CpuArchitectView: React.FC<CpuArchitectViewProps> = ({
     });
   };
 
-  const handleTapeOut = () => {
-    const res = onStartTapeOut(draft);
+  const handleApplyPreset = (preset: ArchitectPresetId) => {
+    const next = applyCpuPreset(draft, preset, state);
+    commitDraft(next);
+    setFeedback({ type: 'ok', msg: `Applied ${preset.replace('_', ' ')} CPU blueprint profile.` });
+  };
+
+  const handleOptimize = (action: OptimizeActionId) => {
+    const next = optimizeCpuDraft(draft, action, state);
+    commitDraft(next);
+    const labelMap: Record<OptimizeActionId, string> = {
+      fit_reticle: 'Fitted die geometry within reticle ceiling.',
+      stabilize_voltage: 'Stabilized core voltage above Vmin threshold.',
+      match_cooling: 'Matched cooling solution and TDP envelope to raw power draw.',
+      balance_bandwidth: 'Balanced RAM technology and channels for core count.',
+    };
+    setFeedback({ type: 'ok', msg: labelMap[action] });
+  };
+
+  const handleReset = () => {
+    const starter = createStarterCpuDraft();
+    const bestNode = unlockedNodes[unlockedNodes.length - 1] ?? unlockedNodes[0];
+    commitDraft(applyCpuNodeChange(starter, bestNode.id));
+    setFeedback({ type: 'ok', msg: `Reset CPU draft on ${bestNode.name}.` });
+  };
+
+  const handleTapeOut = (autoAssignLineId?: string) => {
+    const res = onStartTapeOut(draft, autoAssignLineId);
     if (res.error) {
       setFeedback({ type: 'error', msg: res.error });
     } else {
       setFeedback({
         type: 'ok',
-        msg: `${draft.name} committed to Tape-Out (${physics.tapeOutDays} days).`,
+        msg: `${draft.name} committed to Tape-Out (${physics.tapeOutDays} days)${autoAssignLineId ? ' with auto-deploy armed' : ''}.`,
       });
     }
   };
 
+  const formatClock = (ghz: number) =>
+    ghz < 1 ? `${Math.round(ghz * 1000)} MHz` : `${ghz.toFixed(2)} GHz`;
+
+  const telemetryRows: TelemetryMetricRow[] = [
+    {
+      label: 'Transistor Count',
+      value:
+        physics.transistorCountMTr >= 1000
+          ? `${(physics.transistorCountMTr / 1000).toFixed(2)} B`
+          : `${physics.transistorCountMTr.toFixed(2)} M`,
+      baselineDelta: baselineEval
+        ? formatDelta(physics.transistorCountMTr, baselineEval.physics.transistorCountMTr, true)
+        : null,
+    },
+    {
+      label: 'Sustained Clock',
+      value: formatClock(physics.sustainedClockGHz),
+      tone: 'cyan',
+      baselineDelta: baselineEval
+        ? formatDelta(physics.sustainedClockGHz, baselineEval.physics.sustainedClockGHz, true)
+        : null,
+    },
+    {
+      label: 'Effective IPC',
+      value: `${(physics.effectiveIpc ?? currentArch.baseIpc * draft.ipcTuning).toFixed(2)} IPC`,
+      baselineDelta:
+        baselineEval && physics.effectiveIpc && baselineEval.physics.effectiveIpc
+          ? formatDelta(physics.effectiveIpc, baselineEval.physics.effectiveIpc, true)
+          : null,
+    },
+    {
+      label: 'Effective Power',
+      value: `${physics.effectivePowerW.toFixed(1)} W${physics.carnotOverheadW > 0 ? ` (+${physics.carnotOverheadW.toFixed(0)}W cryo)` : ''}`,
+      tone: physics.powerThrottledRatio < 0.96 ? 'amber' : 'default',
+      baselineDelta: baselineEval
+        ? formatDelta(physics.effectivePowerW, baselineEval.physics.effectivePowerW, false, 'W')
+        : null,
+    },
+    {
+      label: 'Memory Bandwidth',
+      value: `${physics.memoryBandwidthGBs.toFixed(1)} GB/s`,
+      tone: 'teal',
+      baselineDelta: baselineEval
+        ? formatDelta(physics.memoryBandwidthGBs, baselineEval.physics.memoryBandwidthGBs, true)
+        : null,
+    },
+    {
+      label: 'Single / Multi Score',
+      value: `${benchmarks.singleCoreCpu} / ${benchmarks.multiCoreCpu}`,
+      tone: 'cyan',
+      baselineDelta: baselineEval
+        ? formatDelta(benchmarks.multiCoreCpu, baselineEval.benchmarks.multiCoreCpu, true)
+        : null,
+    },
+    {
+      label: 'Est. Yield (Best Fab)',
+      value: `${physics.yieldPercent.toFixed(1)}% (${physics.goodDiesPerWafer.toFixed(0)}/wfr)`,
+      tone: physics.yieldPercent < 45 ? 'amber' : 'emerald',
+      baselineDelta: baselineEval
+        ? formatDelta(physics.yieldPercent, baselineEval.physics.yieldPercent, true, '%')
+        : null,
+    },
+  ];
+
   return (
-    <div className="p-6 max-w-[1440px] mx-auto space-y-5">
-      {/* Header */}
-      <div className="flex flex-wrap items-end justify-between gap-4 border-b border-[#1F2A3D] pb-4">
-        <div>
-          <h1 className="text-2xl font-bold text-[#E8EEF7] tracking-tight">CPU Architect</h1>
-          <p className="text-sm text-[#8C9BB2] mt-0.5">
-            Configure silicon geometry, voltage-frequency targets, caches, and interconnects with real-time physics feedback
-          </p>
+    <ArchitectStudioShell
+      title="CPU Architect"
+      subtitle="Configure silicon geometry, voltage-frequency envelopes, caches, and interconnects with live physics verification"
+      accent="cyan"
+      state={state}
+      draftName={draft.name}
+      nodeLabel={currentNode.name}
+      evaluation={evaluation}
+      baselineChips={cpuChips}
+      baselineChipId={baselineChipId}
+      baselineEval={baselineEval}
+      onSelectBaseline={setBaselineChipId}
+      thermalOverlay={thermalOverlay}
+      onToggleThermal={onToggleThermal}
+      canUndo={canUndo}
+      canRedo={canRedo}
+      onUndo={undo}
+      onRedo={redo}
+      onResetDefaults={handleReset}
+      onAutoName={() => patch({ name: generateSmartChipName(draft, cpuChips.length) })}
+      onApplyPreset={handleApplyPreset}
+      onOptimize={handleOptimize}
+      onTestPrototype={onTestPrototype}
+      onStartTapeOut={handleTapeOut}
+      feedback={feedback}
+      telemetryRows={telemetryRows}
+      nextUnlockHints={nextUnlockHints}
+      onJumpToTech={onJumpToTech}
+    >
+      {/* 01. Process, Architecture & Substrate */}
+      <AccordionSection
+        indexLabel="01"
+        title="Silicon Process & Architecture"
+        summary={`${currentNode.name} · ${currentArch.name}`}
+        defaultOpen
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+          <label className="space-y-1 block">
+            <span className="text-xs text-[#8C9BB2]">Processor Designation</span>
+            <input
+              type="text"
+              value={draft.name}
+              onChange={(e) => patch({ name: e.target.value })}
+              className="w-full h-9 px-3 rounded bg-[#0A0E16] border border-[#1E293B] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
+            />
+          </label>
+
+          <label className="space-y-1 block">
+            <span className="text-xs text-[#8C9BB2]">Process Node</span>
+            <select
+              value={draft.processNodeId}
+              onChange={(e) => commitDraft(applyCpuNodeChange(draft, e.target.value))}
+              className="foundry-select w-full h-9 px-2.5 rounded bg-[#0A0E16] border border-[#1E293B] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
+            >
+              {unlockedNodes.map((n) => (
+                <option key={n.id} value={n.id}>
+                  {n.name} ({n.logicDensityMTrPerMm2} MTr/mm²)
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="space-y-1 block">
+            <span className="text-xs text-[#8C9BB2]">CPU Microarchitecture</span>
+            <select
+              value={draft.architectureId}
+              onChange={(e) => commitDraft(applyCpuArchChange(draft, e.target.value))}
+              className="foundry-select w-full h-9 px-2.5 rounded bg-[#0A0E16] border border-[#1E293B] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
+            >
+              {unlockedArchs.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name} (IPC {a.baseIpc}×)
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="space-y-1 block">
+            <span className="text-xs text-[#8C9BB2]">Transistor Structure</span>
+            <select
+              value={draft.transistorStructureId}
+              onChange={(e) => commitDraft(applyCpuTransistorChange(draft, e.target.value))}
+              className="foundry-select w-full h-9 px-2.5 rounded bg-[#0A0E16] border border-[#1E293B] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
+            >
+              {unlockedTransistors.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name} ({t.densityMultiplier}× dens)
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="space-y-1 block sm:col-span-2">
+            <span className="text-xs text-[#8C9BB2]">Packaging &amp; Interconnect Substrate</span>
+            <select
+              value={draft.packagingId}
+              onChange={(e) => patch({ packagingId: e.target.value })}
+              className="foundry-select w-full h-9 px-2.5 rounded bg-[#0A0E16] border border-[#1E293B] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
+            >
+              {unlockedPackaging.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name} (max {p.maxDieAreaMm2} mm² · {p.interconnectBonus}× scaling)
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onTestPrototype}
-            className="h-9 px-3.5 rounded-md bg-[#111622] hover:bg-[#171E2E] text-[#E8EEF7] border border-[#2C3B55] text-xs font-medium flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
-          >
-            <Gauge className="w-3.5 h-3.5 text-[#06B6D4]" />
-            <span>Run Full Benchmarks</span>
-          </button>
-          <button
-            type="button"
-            onClick={handleTapeOut}
-            disabled={physics.exceedsReticle || physics.voltageUnstable}
-            className="h-9 px-4 rounded-md bg-[#06B6D4] hover:bg-[#22D3EE] disabled:opacity-40 text-[#07090E] text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap cursor-pointer disabled:cursor-not-allowed"
-          >
-            <Play className="w-3.5 h-3.5" />
-            <span>
-              Start Tape-Out ({formatCompactNumber(physics.tapeOutCreditCost, 0)} CR ·{' '}
-              {physics.tapeOutDays}d)
-            </span>
-          </button>
-        </div>
-      </div>
+      </AccordionSection>
 
-      {feedback && (
-        <div
-          className={`px-4 py-2.5 rounded-md border text-xs flex items-center gap-2 ${
-            feedback.type === 'error'
-              ? 'bg-rose-950/60 border-rose-500/40 text-rose-200'
-              : 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
-          }`}
-        >
-          {feedback.type === 'error' ? (
-            <AlertTriangle className="w-4 h-4 shrink-0" />
-          ) : (
-            <CheckCircle2 className="w-4 h-4 shrink-0" />
-          )}
-          <span>{feedback.msg}</span>
-        </div>
-      )}
-
-      {/* Asymmetric Split Console */}
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-        {/* Left 7 cols: Engineering Workbench */}
-        <div className="xl:col-span-7 space-y-5">
-          {/* Identity & Fabrication Stack */}
-          <section className="bg-[#111622] border border-[#1F2A3D] rounded-lg p-4 space-y-4">
-            <h2 className="text-xs font-semibold text-[#8C9BB2] tracking-wide">
-              01. Silicon Process &amp; Architecture
-            </h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-              <label className="space-y-1 block">
-                <span className="text-xs text-[#8C9BB2]">Processor Designation</span>
-                <input
-                  type="text"
-                  value={draft.name}
-                  onChange={(e) => patch({ name: e.target.value })}
-                  className="w-full h-9 px-3 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-sm text-[#E8EEF7]"
-                />
-              </label>
-
-              <label className="space-y-1 block">
-                <span className="text-xs text-[#8C9BB2]">Process Node</span>
-                <select
-                  value={draft.processNodeId}
-                  onChange={(e) => handleNodeChange(e.target.value)}
-                  className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
-                >
-                  {unlockedNodes.map((n) => (
-                    <option key={n.id} value={n.id}>
-                      {n.name} ({n.logicDensityMTrPerMm2} MTr/mm²)
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="space-y-1 block">
-                <span className="text-xs text-[#8C9BB2]">CPU Microarchitecture</span>
-                <select
-                  value={draft.architectureId}
-                  onChange={(e) => handleArchChange(e.target.value)}
-                  className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
-                >
-                  {unlockedArchs.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.name} (IPC {a.baseIpc}×)
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="space-y-1 block">
-                <span className="text-xs text-[#8C9BB2]">Transistor Structure</span>
-                <select
-                  value={draft.transistorStructureId}
-                  onChange={(e) => handleTransistorChange(e.target.value)}
-                  className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
-                >
-                  {unlockedTransistors.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.name} ({t.densityMultiplier}× dens)
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="space-y-1 block sm:col-span-2">
-                <span className="text-xs text-[#8C9BB2]">Packaging &amp; Interconnect Substrate</span>
-                <select
-                  value={draft.packagingId}
-                  onChange={(e) => patch({ packagingId: e.target.value })}
-                  className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
-                >
-                  {unlockedPackaging.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} (max {p.maxDieAreaMm2} mm² · {p.interconnectBonus}× scaling)
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-          </section>
-
-          {/* Cores, Clocks, Voltage & IPC */}
-          <section className="bg-[#111622] border border-[#1F2A3D] rounded-lg p-4 space-y-4">
-            <h2 className="text-xs font-semibold text-[#8C9BB2] tracking-wide">
-              02. Core Topology, Clocks &amp; Voltage
-            </h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">Performance Cores (P-Cores)</span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">
-                    {draft.pCores} / {currentArch.maxPCores}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={1}
-                  max={currentArch.maxPCores}
-                  value={draft.pCores}
-                  onChange={(e) => patch({ pCores: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">Efficiency Cores (E-Cores)</span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">
-                    {currentArch.supportsECores
-                      ? `${draft.eCores} / ${currentArch.maxECores}`
-                      : 'Requires Superscalar+'}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={Math.max(0, currentArch.maxECores)}
-                  disabled={!currentArch.supportsECores}
-                  value={draft.eCores}
-                  onChange={(e) => patch({ eCores: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">Target P-Core Clock</span>
-                  <span className="font-mono tabular-nums text-[#22D3EE]">
-                    {draft.pClockGHz < 1
-                      ? `${Math.round(draft.pClockGHz * 1000)} MHz`
-                      : `${draft.pClockGHz.toFixed(2)} GHz`}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={sliderBounds.pClockGHz.min}
-                  max={sliderBounds.pClockGHz.max}
-                  step={sliderBounds.pClockGHz.step}
-                  value={clampToSlider(draft.pClockGHz, sliderBounds.pClockGHz)}
-                  onChange={(e) => {
-                    const nextP = Number(e.target.value);
-                    patch({
-                      pClockGHz: nextP,
-                      eClockGHz: Math.min(draft.eClockGHz, nextP),
-                    });
-                  }}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between gap-2 text-xs">
-                  <span className="text-[#8C9BB2] truncate">
-                    Core Voltage (Vmin {physics.minStableVoltageV.toFixed(2)} V)
-                  </span>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        patch({
-                          voltageV: getStabilizedVoltageV(
-                            physics.minStableVoltageV,
-                            sliderBounds.voltageV
-                          ),
-                        })
-                      }
-                      className={`h-5 px-2 rounded text-[11px] font-medium border transition-colors whitespace-nowrap cursor-pointer ${
-                        physics.voltageUnstable
-                          ? 'bg-rose-500/20 border-rose-400/60 text-rose-200 hover:bg-rose-500/30'
-                          : 'bg-[#0B0F17] border-[#2C3B55] text-[#22D3EE] hover:bg-[#171E2E]'
-                      }`}
-                    >
-                      Auto-Stabilize
-                    </button>
-                    <span
-                      className={`font-mono tabular-nums ${
-                        physics.voltageUnstable ? 'text-rose-400 font-semibold' : 'text-[#E8EEF7]'
-                      }`}
-                    >
-                      {draft.voltageV.toFixed(2)} V
-                    </span>
-                  </div>
-                </div>
-                <input
-                  type="range"
-                  min={sliderBounds.voltageV.min}
-                  max={sliderBounds.voltageV.max}
-                  step={sliderBounds.voltageV.step}
-                  value={clampToSlider(draft.voltageV, sliderBounds.voltageV)}
-                  onChange={(e) => patch({ voltageV: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">Microarchitecture IPC Tuning</span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">
-                    {(physics.effectiveIpc ?? currentArch.baseIpc * draft.ipcTuning).toFixed(2)} IPC ({draft.ipcTuning.toFixed(2)}×)
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={sliderBounds.ipcTuning.min}
-                  max={sliderBounds.ipcTuning.max}
-                  step={sliderBounds.ipcTuning.step}
-                  value={clampToSlider(draft.ipcTuning, sliderBounds.ipcTuning)}
-                  onChange={(e) => patch({ ipcTuning: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              {currentArch.supportsECores && draft.eCores > 0 && (
-                <div className="space-y-1.5">
-                  <div className="flex justify-between text-xs">
-                    <span className="text-[#8C9BB2]">Target E-Core Clock</span>
-                    <span className="font-mono tabular-nums text-[#E8EEF7]">
-                      {draft.eClockGHz < 1
-                        ? `${Math.round(draft.eClockGHz * 1000)} MHz`
-                        : `${draft.eClockGHz.toFixed(2)} GHz`}
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    min={sliderBounds.eClockGHz.min}
-                    max={sliderBounds.eClockGHz.max}
-                    step={sliderBounds.eClockGHz.step}
-                    value={clampToSlider(draft.eClockGHz, sliderBounds.eClockGHz)}
-                    onChange={(e) => patch({ eClockGHz: Number(e.target.value) })}
-                    className="foundry-slider"
-                  />
-                </div>
-              )}
-            </div>
-          </section>
-
-          {/* Cache Hierarchy & ISA */}
-          <section className="bg-[#111622] border border-[#1F2A3D] rounded-lg p-4 space-y-4">
-            <h2 className="text-xs font-semibold text-[#8C9BB2] tracking-wide">
-              03. Cache Hierarchy &amp; Instruction Set Extensions
-            </h2>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">L1 / Core</span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">
-                    {draft.l1CacheKBPerCore} KB
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={sliderBounds.l1CacheKBPerCore.min}
-                  max={sliderBounds.l1CacheKBPerCore.max}
-                  step={sliderBounds.l1CacheKBPerCore.step}
-                  value={clampToSlider(draft.l1CacheKBPerCore, sliderBounds.l1CacheKBPerCore)}
-                  onChange={(e) => patch({ l1CacheKBPerCore: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">L2 Total</span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">
-                    {draft.l2CacheMBTotal === 0
-                      ? 'None'
-                      : draft.l2CacheMBTotal < 1
-                        ? `${Math.round(draft.l2CacheMBTotal * 1024)} KB`
-                        : `${draft.l2CacheMBTotal.toFixed(1)} MB`}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={sliderBounds.l2CacheMBTotal.min}
-                  max={sliderBounds.l2CacheMBTotal.max}
-                  step={sliderBounds.l2CacheMBTotal.step}
-                  value={clampToSlider(draft.l2CacheMBTotal, sliderBounds.l2CacheMBTotal)}
-                  onChange={(e) => patch({ l2CacheMBTotal: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">L3 Shared</span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">
-                    {draft.l3CacheMBTotal === 0 ? 'None' : `${draft.l3CacheMBTotal} MB`}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={sliderBounds.l3CacheMBTotal.min}
-                  max={sliderBounds.l3CacheMBTotal.max}
-                  step={sliderBounds.l3CacheMBTotal.step}
-                  value={clampToSlider(draft.l3CacheMBTotal, sliderBounds.l3CacheMBTotal)}
-                  onChange={(e) => patch({ l3CacheMBTotal: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-            </div>
-
-            <div className="pt-2 border-t border-[#1F2A3D] space-y-2">
-              <div className="text-xs text-[#8C9BB2]">Enabled Instruction Sets &amp; SIMD</div>
-              <div className="flex flex-wrap gap-2">
-                {unlockedIsa.map((ext) => {
-                  const active = draft.isaExtensions.includes(ext.id);
-                  return (
-                    <button
-                      key={ext.id}
-                      type="button"
-                      onClick={() => toggleIsa(ext.id)}
-                      className={`h-8 px-3 rounded text-xs font-mono border transition-colors whitespace-nowrap cursor-pointer ${
-                        active
-                          ? 'bg-[#06B6D4]/20 border-[#06B6D4]/50 text-[#22D3EE]'
-                          : 'bg-[#0B0F17] border-[#1F2A3D] text-[#8C9BB2] hover:text-[#E8EEF7]'
-                      }`}
-                    >
-                      {ext.shortLabel}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          </section>
-
-          {/* Memory, I/O, SoC Accelerators & Thermal Envelope */}
-          <section className="bg-[#111622] border border-[#1F2A3D] rounded-lg p-4 space-y-4">
-            <h2 className="text-xs font-semibold text-[#8C9BB2] tracking-wide">
-              04. Memory, I/O, Accelerators &amp; Thermal Envelope
-            </h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <label className="space-y-1 block">
-                <span className="text-xs text-[#8C9BB2]">Supported RAM Technology</span>
-                <select
-                  value={draft.memoryTechId}
-                  onChange={(e) => patch({ memoryTechId: e.target.value })}
-                  className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
-                >
-                  {unlockedRam.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.name} ({m.gbpsPerUnit} GB/s per ch)
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">Memory Channels ({physics.memoryBandwidthGBs.toFixed(1)} GB/s)</span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">{draft.memoryChannels} ch</span>
-                </div>
-                <input
-                  type="range"
-                  min={1}
-                  max={16}
-                  value={draft.memoryChannels}
-                  onChange={(e) => patch({ memoryChannels: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">
-                    PCIe Lanes (Gen {maxPcieGen} · {(physics.pcieBandwidthGBs ?? 0).toFixed(1)} GB/s)
-                  </span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">{draft.pcieLanes} lanes</span>
-                </div>
-                <input
-                  type="range"
-                  min={sliderBounds.pcieLanes.min}
-                  max={sliderBounds.pcieLanes.max}
-                  step={sliderBounds.pcieLanes.step}
-                  value={clampToSlider(draft.pcieLanes, sliderBounds.pcieLanes)}
-                  onChange={(e) => patch({ pcieLanes: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">Package Power Limit (TDP)</span>
-                  <span className="font-mono tabular-nums text-[#D97706]">{draft.powerLimitW} W</span>
-                </div>
-                <input
-                  type="range"
-                  min={sliderBounds.powerLimitW.min}
-                  max={sliderBounds.powerLimitW.max}
-                  step={sliderBounds.powerLimitW.step}
-                  value={clampToSlider(draft.powerLimitW, sliderBounds.powerLimitW)}
-                  onChange={(e) => patch({ powerLimitW: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">Integrated GPU Tier</span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">
-                    {socUnlocked ? (draft.igpuTier === 0 ? 'Disabled' : `Tier ${draft.igpuTier}`) : 'Research SoC Tech'}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={5}
-                  disabled={!socUnlocked}
-                  value={draft.igpuTier}
-                  onChange={(e) => patch({ igpuTier: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-[#8C9BB2]">Neural Engine (NPU) Tier</span>
-                  <span className="font-mono tabular-nums text-[#E8EEF7]">
-                    {socUnlocked ? (draft.npuTier === 0 ? 'Disabled' : `Tier ${draft.npuTier}`) : 'Research SoC Tech'}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={5}
-                  disabled={!socUnlocked}
-                  value={draft.npuTier}
-                  onChange={(e) => patch({ npuTier: Number(e.target.value) })}
-                  className="foundry-slider"
-                />
-              </div>
-
-              <label className="space-y-1 block sm:col-span-2">
-                <span className="text-xs text-[#8C9BB2]">Cooling Solution</span>
-                <select
-                  value={draft.coolingId}
-                  onChange={(e) => patch({ coolingId: e.target.value })}
-                  className="w-full h-9 px-2.5 rounded bg-[#0B0F17] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
-                >
-                  {unlockedCooling.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} (Rθ {c.thermalResistanceCPerW} °C/W · Limit {c.throttleTempC} °C)
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-          </section>
-        </div>
-
-        {/* Right 5 cols: Live 2D SVG Die Floorplan + Physics & Bottleneck Telemetry */}
-        <div className="xl:col-span-5 space-y-5 xl:sticky xl:top-6">
-          <DieFloorplanSVG
-            title={draft.name || 'Unnamed CPU'}
-            nodeLabel={currentNode.name}
-            physics={physics}
-            thermalOverlay={thermalOverlay}
-            onToggleThermal={onToggleThermal}
+      {/* 02. Core Topology, Clocks & Voltage */}
+      <AccordionSection
+        indexLabel="02"
+        title="Core Topology, Clocks & Voltage"
+        summary={`${draft.pCores}P${draft.eCores > 0 ? `+${draft.eCores}E` : ''} · ${formatClock(draft.pClockGHz)} · ${draft.voltageV.toFixed(2)}V`}
+        defaultOpen
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <PrecisionSlider
+            label="Performance Cores (P-Cores)"
+            value={draft.pCores}
+            min={1}
+            max={currentArch.maxPCores}
+            step={1}
+            displayValue={`${draft.pCores} / ${currentArch.maxPCores}`}
+            onChange={(v) => patch({ pCores: Math.round(v) })}
           />
 
-          {/* Live Physical Telemetry Readout */}
-          <div className="bg-[#111622] border border-[#1F2A3D] rounded-lg p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <h3 className="text-xs font-semibold text-[#8C9BB2] tracking-wide flex items-center gap-1.5">
-                <Layers className="w-3.5 h-3.5 text-[#06B6D4]" />
-                <span>Real-Time Silicon Telemetry</span>
-              </h3>
-              <span className="text-xs font-mono tabular-nums text-[#E8EEF7]">
-                Score {benchmarks.overallRating.toLocaleString()}
-              </span>
-            </div>
+          <PrecisionSlider
+            label="Efficiency Cores (E-Cores)"
+            value={draft.eCores}
+            min={0}
+            max={Math.max(0, currentArch.maxECores)}
+            step={1}
+            disabled={!currentArch.supportsECores}
+            displayValue={
+              currentArch.supportsECores
+                ? `${draft.eCores} / ${currentArch.maxECores}`
+                : 'Superscalar+'
+            }
+            onChange={(v) => patch({ eCores: Math.round(v) })}
+          />
 
-            <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-xs">
-              <div className="flex justify-between border-b border-[#1F2A3D] pb-1.5">
-                <span className="text-[#8C9BB2]">Transistors</span>
-                <span className="font-mono tabular-nums text-[#E8EEF7]">
-                  {physics.transistorCountMTr >= 1000
-                    ? `${(physics.transistorCountMTr / 1000).toFixed(2)} B`
-                    : `${physics.transistorCountMTr.toFixed(2)} M`}
-                </span>
-              </div>
-              <div className="flex justify-between border-b border-[#1F2A3D] pb-1.5">
-                <span className="text-[#8C9BB2]">Sustained Clock</span>
-                <span className="font-mono tabular-nums text-[#22D3EE]">
-                  {physics.sustainedClockGHz < 1
-                    ? `${Math.round(physics.sustainedClockGHz * 1000)} MHz`
-                    : `${physics.sustainedClockGHz.toFixed(2)} GHz`}
-                </span>
-              </div>
-              <div className="flex justify-between border-b border-[#1F2A3D] pb-1.5">
-                <span className="text-[#8C9BB2]">Effective Power</span>
-                <span className="font-mono tabular-nums text-[#E8EEF7]">
-                  {physics.effectivePowerW.toFixed(1)} W
-                  {physics.carnotOverheadW > 0 ? ` (+${physics.carnotOverheadW.toFixed(0)}W cryo)` : ''}
-                </span>
-              </div>
-              <div className="flex justify-between border-b border-[#1F2A3D] pb-1.5">
-                <span className="text-[#8C9BB2]">Junction Temp</span>
-                <span
-                  className={`font-mono tabular-nums ${
-                    physics.thermalThrottledRatio < 0.96
-                      ? 'text-rose-400 font-semibold'
-                      : 'text-emerald-400'
-                  }`}
-                >
-                  {physics.junctionTempC.toFixed(1)} °C
-                </span>
-              </div>
-              <div className="flex justify-between border-b border-[#1F2A3D] pb-1.5">
-                <span className="text-[#8C9BB2]">Estimated yield (best fab)</span>
-                <span
-                  className={`font-mono tabular-nums ${
-                    physics.yieldPercent < 45 ? 'text-amber-400' : 'text-emerald-400'
-                  }`}
-                >
-                  {physics.yieldPercent.toFixed(1)}% ({physics.goodDiesPerWafer.toFixed(0)}/wfr)
-                </span>
-              </div>
-              <div className="flex justify-between border-b border-[#1F2A3D] pb-1.5">
-                <span className="text-[#8C9BB2]">Single / Multi</span>
-                <span className="font-mono tabular-nums text-[#E8EEF7]">
-                  {benchmarks.singleCoreCpu} / {benchmarks.multiCoreCpu}
-                </span>
-              </div>
-            </div>
+          <PrecisionSlider
+            label="Target P-Core Clock"
+            value={clampToSlider(draft.pClockGHz, sliderBounds.pClockGHz)}
+            min={sliderBounds.pClockGHz.min}
+            max={sliderBounds.pClockGHz.max}
+            step={sliderBounds.pClockGHz.step}
+            displayValue={formatClock(draft.pClockGHz)}
+            accent="cyan"
+            threshold={{
+              value: sliderBounds.pClockGHz.min + (sliderBounds.pClockGHz.max - sliderBounds.pClockGHz.min) * 0.82,
+              kind: 'above-warn',
+              label: 'Steep voltage/thermal wall region',
+            }}
+            onChange={(nextP) =>
+              patch({
+                pClockGHz: nextP,
+                eClockGHz: Math.min(draft.eClockGHz, nextP),
+              })
+            }
+          />
 
-            {/* Live Engineering Bottlenecks */}
-            <div className="space-y-2 pt-1">
-              {benchmarks.bottlenecks.slice(0, 3).map((b) => (
-                <div
-                  key={b.id}
-                  className={`p-2.5 rounded border text-xs space-y-0.5 ${
-                    b.severity === 'critical'
-                      ? 'bg-rose-950/40 border-rose-500/40 text-rose-200'
-                      : b.severity === 'warning'
-                        ? 'bg-amber-950/35 border-amber-500/40 text-amber-200'
-                        : 'bg-[#0B0F17] border-[#1F2A3D] text-[#CBD5E1]'
+          <PrecisionSlider
+            label={`Core Voltage (Vmin ${physics.minStableVoltageV.toFixed(2)}V)`}
+            value={clampToSlider(draft.voltageV, sliderBounds.voltageV)}
+            min={sliderBounds.voltageV.min}
+            max={sliderBounds.voltageV.max}
+            step={sliderBounds.voltageV.step}
+            displayValue={`${draft.voltageV.toFixed(2)} V`}
+            accent={physics.voltageUnstable ? 'rose' : 'default'}
+            threshold={{
+              value: physics.minStableVoltageV,
+              kind: 'below-danger',
+              label: `Minimum stable voltage (${physics.minStableVoltageV.toFixed(2)} V)`,
+            }}
+            inlineAction={
+              <button
+                type="button"
+                onClick={() =>
+                  patch({
+                    voltageV: getStabilizedVoltageV(
+                      physics.minStableVoltageV,
+                      sliderBounds.voltageV
+                    ),
+                  })
+                }
+                className={`h-5 px-1.5 rounded text-[10px] font-medium border transition-colors whitespace-nowrap cursor-pointer ${
+                  physics.voltageUnstable
+                    ? 'bg-rose-500/20 border-rose-400/60 text-rose-200 hover:bg-rose-500/30'
+                    : 'bg-[#0A0E16] border-[#2C3B55] text-[#22D3EE] hover:bg-[#161D2D]'
+                }`}
+              >
+                Auto-Vmin
+              </button>
+            }
+            onChange={(v) => patch({ voltageV: v })}
+          />
+
+          <PrecisionSlider
+            label="Microarchitecture IPC Tuning"
+            value={clampToSlider(draft.ipcTuning, sliderBounds.ipcTuning)}
+            min={sliderBounds.ipcTuning.min}
+            max={sliderBounds.ipcTuning.max}
+            step={sliderBounds.ipcTuning.step}
+            displayValue={`${(physics.effectiveIpc ?? currentArch.baseIpc * draft.ipcTuning).toFixed(2)} IPC`}
+            unitHint={`${draft.ipcTuning.toFixed(2)}×`}
+            onChange={(v) => patch({ ipcTuning: v })}
+          />
+
+          {currentArch.supportsECores && draft.eCores > 0 && (
+            <PrecisionSlider
+              label="Target E-Core Clock"
+              value={clampToSlider(draft.eClockGHz, sliderBounds.eClockGHz)}
+              min={sliderBounds.eClockGHz.min}
+              max={sliderBounds.eClockGHz.max}
+              step={sliderBounds.eClockGHz.step}
+              displayValue={formatClock(draft.eClockGHz)}
+              onChange={(v) => patch({ eClockGHz: v })}
+            />
+          )}
+        </div>
+      </AccordionSection>
+
+      {/* 03. Cache Hierarchy & ISA */}
+      <AccordionSection
+        indexLabel="03"
+        title="Cache Hierarchy & Instruction Sets"
+        summary={`L1 ${draft.l1CacheKBPerCore}KB · L2 ${draft.l2CacheMBTotal < 1 ? `${Math.round(draft.l2CacheMBTotal * 1024)}KB` : `${draft.l2CacheMBTotal.toFixed(1)}MB`} · L3 ${draft.l3CacheMBTotal}MB`}
+        defaultOpen
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <PrecisionSlider
+            label="L1 / Core"
+            value={clampToSlider(draft.l1CacheKBPerCore, sliderBounds.l1CacheKBPerCore)}
+            min={sliderBounds.l1CacheKBPerCore.min}
+            max={sliderBounds.l1CacheKBPerCore.max}
+            step={sliderBounds.l1CacheKBPerCore.step}
+            displayValue={`${draft.l1CacheKBPerCore} KB`}
+            onChange={(v) => patch({ l1CacheKBPerCore: v })}
+          />
+
+          <PrecisionSlider
+            label="L2 Total"
+            value={clampToSlider(draft.l2CacheMBTotal, sliderBounds.l2CacheMBTotal)}
+            min={sliderBounds.l2CacheMBTotal.min}
+            max={sliderBounds.l2CacheMBTotal.max}
+            step={sliderBounds.l2CacheMBTotal.step}
+            displayValue={
+              draft.l2CacheMBTotal === 0
+                ? 'None'
+                : draft.l2CacheMBTotal < 1
+                  ? `${Math.round(draft.l2CacheMBTotal * 1024)} KB`
+                  : `${draft.l2CacheMBTotal.toFixed(1)} MB`
+            }
+            onChange={(v) => patch({ l2CacheMBTotal: v })}
+          />
+
+          <PrecisionSlider
+            label="L3 Shared"
+            value={clampToSlider(draft.l3CacheMBTotal, sliderBounds.l3CacheMBTotal)}
+            min={sliderBounds.l3CacheMBTotal.min}
+            max={sliderBounds.l3CacheMBTotal.max}
+            step={sliderBounds.l3CacheMBTotal.step}
+            displayValue={draft.l3CacheMBTotal === 0 ? 'None' : `${draft.l3CacheMBTotal} MB`}
+            onChange={(v) => patch({ l3CacheMBTotal: v })}
+          />
+        </div>
+
+        <div className="pt-2 border-t border-[#1E293B] space-y-2">
+          <div className="text-xs text-[#8C9BB2]">Enabled Instruction Sets &amp; SIMD</div>
+          <div className="flex flex-wrap gap-1.5">
+            {unlockedIsa.map((ext) => {
+              const active = draft.isaExtensions.includes(ext.id);
+              return (
+                <button
+                  key={ext.id}
+                  type="button"
+                  onClick={() => toggleIsa(ext.id)}
+                  className={`h-7 px-2.5 rounded text-[11px] font-mono border transition-colors whitespace-nowrap cursor-pointer ${
+                    active
+                      ? 'bg-[#06B6D4]/20 border-[#06B6D4]/55 text-[#22D3EE]'
+                      : 'bg-[#0A0E16] border-[#1E293B] text-[#8C9BB2] hover:text-[#E8EEF7]'
                   }`}
                 >
-                  <div className="font-semibold">
-                    {b.severity === 'critical' ? 'Critical: ' : b.severity === 'warning' ? 'Bottleneck: ' : ''}
-                    {b.title}
-                  </div>
-                  <p className="text-[11px] opacity-90">{b.explanation}</p>
-                </div>
-              ))}
-            </div>
+                  {ext.shortLabel}
+                </button>
+              );
+            })}
           </div>
         </div>
-      </div>
-    </div>
+      </AccordionSection>
+
+      {/* 04. Memory, I/O, Accelerators & Thermal Envelope */}
+      <AccordionSection
+        indexLabel="04"
+        title="Memory, I/O, SoC Accelerators & Cooling"
+        summary={`${draft.memoryChannels}ch (${physics.memoryBandwidthGBs.toFixed(0)} GB/s) · ${draft.powerLimitW}W TDP`}
+        defaultOpen
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <label className="space-y-1 block">
+            <span className="text-xs text-[#8C9BB2]">Supported RAM Technology</span>
+            <select
+              value={draft.memoryTechId}
+              onChange={(e) => patch({ memoryTechId: e.target.value })}
+              className="foundry-select w-full h-9 px-2.5 rounded bg-[#0A0E16] border border-[#1E293B] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
+            >
+              {unlockedRam.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name} ({m.gbpsPerUnit} GB/s per ch)
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <PrecisionSlider
+            label={`Memory Channels (${physics.memoryBandwidthGBs.toFixed(1)} GB/s)`}
+            value={draft.memoryChannels}
+            min={1}
+            max={16}
+            step={1}
+            displayValue={`${draft.memoryChannels} ch`}
+            accent="teal"
+            onChange={(v) => patch({ memoryChannels: Math.round(v) })}
+          />
+
+          <PrecisionSlider
+            label={`PCIe Lanes (Gen ${maxPcieGen} · ${(physics.pcieBandwidthGBs ?? 0).toFixed(1)} GB/s)`}
+            value={clampToSlider(draft.pcieLanes, sliderBounds.pcieLanes)}
+            min={sliderBounds.pcieLanes.min}
+            max={sliderBounds.pcieLanes.max}
+            step={sliderBounds.pcieLanes.step}
+            displayValue={`${draft.pcieLanes} lanes`}
+            onChange={(v) => patch({ pcieLanes: Math.round(v) })}
+          />
+
+          <PrecisionSlider
+            label="Package Power Limit (TDP)"
+            value={clampToSlider(draft.powerLimitW, sliderBounds.powerLimitW)}
+            min={sliderBounds.powerLimitW.min}
+            max={sliderBounds.powerLimitW.max}
+            step={sliderBounds.powerLimitW.step}
+            displayValue={`${draft.powerLimitW} W`}
+            accent="amber"
+            onChange={(v) => patch({ powerLimitW: Math.round(v) })}
+          />
+
+          <PrecisionSlider
+            label="Integrated GPU Tier"
+            value={draft.igpuTier}
+            min={0}
+            max={5}
+            step={1}
+            disabled={!socUnlocked}
+            displayValue={
+              socUnlocked ? (draft.igpuTier === 0 ? 'Disabled' : `Tier ${draft.igpuTier}`) : 'Research SoC'
+            }
+            onChange={(v) => patch({ igpuTier: Math.round(v) })}
+          />
+
+          <PrecisionSlider
+            label="Neural Engine (NPU) Tier"
+            value={draft.npuTier}
+            min={0}
+            max={5}
+            step={1}
+            disabled={!socUnlocked}
+            displayValue={
+              socUnlocked ? (draft.npuTier === 0 ? 'Disabled' : `Tier ${draft.npuTier}`) : 'Research SoC'
+            }
+            onChange={(v) => patch({ npuTier: Math.round(v) })}
+          />
+
+          <label className="space-y-1 block sm:col-span-2">
+            <span className="text-xs text-[#8C9BB2]">Cooling Solution</span>
+            <select
+              value={draft.coolingId}
+              onChange={(e) => patch({ coolingId: e.target.value })}
+              className="foundry-select w-full h-9 px-2.5 rounded bg-[#0A0E16] border border-[#1E293B] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7]"
+            >
+              {unlockedCooling.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name} (Rθ {c.thermalResistanceCPerW} °C/W · Limit {c.throttleTempC} °C)
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </AccordionSection>
+    </ArchitectStudioShell>
   );
 };

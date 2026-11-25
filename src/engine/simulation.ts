@@ -779,6 +779,9 @@ export interface TickResult {
   state: GameState;
   milestoneTriggered: boolean;
   shouldAutosave: boolean;
+  triggeredCategories?: MilestoneEvent['category'][];
+  enteredDebt?: boolean;
+  enteredStarvation?: boolean;
 }
 
 /**
@@ -794,7 +797,13 @@ export function advanceSimulationDays(
   }
 
   let state = prevState;
+  const wasInDebt = Boolean(prevState.telemetry.inDebt) || prevState.credits < 0;
+  const wasStarved =
+    prevState.telemetry.siliconStarved ||
+    prevState.telemetry.powerDeficit ||
+    prevState.telemetry.packagingStarved;
   let milestoneTriggered = false;
+  const triggeredCategories: MilestoneEvent['category'][] = [];
   let shouldAutosave = false;
   let needsTelemetryRefresh = false;
 
@@ -868,6 +877,7 @@ export function advanceSimulationDays(
             globalPhysicsRevision += 1;
             needsTelemetryRefresh = true;
             milestoneTriggered = true;
+            triggeredCategories.push('research');
             events = appendEvent(events, {
               id: `evt_tech_${tech.id}_${totalDays}`,
               year,
@@ -894,6 +904,7 @@ export function advanceSimulationDays(
     // 3. Tape-Out Engineering Projects (accelerated by Architecture staff)
     let tapeOutQueue = state.tapeOutQueue;
     let chips = state.chips;
+    let productionLines = state.productionLines;
     if (tapeOutQueue.length > 0) {
       const archSpeed = 1 + Math.log10(1 + state.staff.architecture) * 0.45;
       const nextQueue: typeof tapeOutQueue = [];
@@ -903,7 +914,18 @@ export function advanceSimulationDays(
           chips = chips.map((c) =>
             c.id === job.chipId ? { ...c, status: 'production' } : c
           );
+          let deployedNote = 'ready to assign in Manufacturing.';
+          if (job.autoAssignLineId) {
+            const targetLine = productionLines.find((l) => l.id === job.autoAssignLineId);
+            if (targetLine) {
+              productionLines = productionLines.map((l) =>
+                l.id === job.autoAssignLineId ? { ...l, chipId: job.chipId } : l
+              );
+              deployedNote = 'automatically deployed to the designated Fab line.';
+            }
+          }
           milestoneTriggered = true;
+          triggeredCategories.push('tapeout');
           needsTelemetryRefresh = true;
           events = appendEvent(events, {
             id: `evt_tapeout_${job.chipId}_${totalDays}`,
@@ -912,7 +934,7 @@ export function advanceSimulationDays(
             day,
             category: 'tapeout',
             title: `Tape-Out Complete: ${job.chipName}`,
-            detail: `${job.kind.toUpperCase()} passed silicon bring-up and is ready to assign in Manufacturing.`,
+            detail: `${job.kind.toUpperCase()} passed silicon bring-up and is ${deployedNote}`,
           });
         } else {
           nextQueue.push({ ...job, daysCompleted: nextDays });
@@ -924,7 +946,6 @@ export function advanceSimulationDays(
     // 4. Infrastructure Construction & Upgrades
     let constructionQueue = state.constructionQueue;
     let facilities = state.facilities;
-    let productionLines = state.productionLines;
     if (constructionQueue.length > 0) {
       const nextConst: typeof constructionQueue = [];
       for (const job of constructionQueue) {
@@ -1011,6 +1032,7 @@ export function advanceSimulationDays(
             }
           }
           milestoneTriggered = true;
+          triggeredCategories.push('construction');
           needsTelemetryRefresh = true;
           events = appendEvent(events, {
             id: `evt_const_${job.id}_${totalDays}`,
@@ -1109,7 +1131,20 @@ export function advanceSimulationDays(
     state = recomputeTelemetry(state, cache);
   }
 
-  return { state, milestoneTriggered, shouldAutosave };
+  const nowInDebt = Boolean(state.telemetry.inDebt) || state.credits < 0;
+  const nowStarved =
+    state.telemetry.siliconStarved ||
+    state.telemetry.powerDeficit ||
+    state.telemetry.packagingStarved;
+
+  return {
+    state,
+    milestoneTriggered,
+    shouldAutosave,
+    triggeredCategories,
+    enteredDebt: !wasInDebt && nowInDebt,
+    enteredStarvation: !wasStarved && nowStarved,
+  };
 }
 
 // ─── PLAYER COMMAND HANDLERS (PURE REDUCERS) ─────────────────────────────────
@@ -1199,7 +1234,8 @@ export function advanceFrontierTrack(
 export function startChipTapeOut(
   state: GameState,
   draft: ChipBlueprint,
-  cache: ChipMetricsCache
+  cache: ChipMetricsCache,
+  autoAssignLineId?: string
 ): { state: GameState; error?: string } {
   const ctx = buildPreviewPhysicsContext(state, draft.processNodeId, 1.0);
   const evalRes = cache.getOrCompute(draft, ctx, state.globalPhysicsRevision);
@@ -1245,6 +1281,7 @@ export function startChipTapeOut(
         kind: committedChip.kind,
         daysCompleted: 0,
         totalDays: evalRes.physics.tapeOutDays,
+        ...(autoAssignLineId ? { autoAssignLineId } : {}),
       },
     ],
     events: appendEvent(state.events, {
@@ -1259,6 +1296,12 @@ export function startChipTapeOut(
   };
 
   return { state: nextState };
+}
+
+export function renameCompany(state: GameState, nextName: string): GameState {
+  const trimmed = nextName.trim().slice(0, 48);
+  if (!trimmed || trimmed === state.companyName) return state;
+  return { ...state, companyName: trimmed };
 }
 
 export function queueFacilityBuild(

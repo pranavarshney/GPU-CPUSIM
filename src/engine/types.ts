@@ -566,6 +566,7 @@ export interface TapeOutProject {
   kind: 'cpu' | 'gpu' | 'memory';
   daysCompleted: number;
   totalDays: number;
+  autoAssignLineId?: string;
 }
 
 export interface ConstructionProject {
@@ -700,4 +701,12 @@ export interface UiSettings {
   pauseOnMilestone: boolean;
   thermalOverlayDefault: boolean;
   showEquationsBanner: boolean;
+  pauseOnResearch?: boolean;
+  pauseOnTapeOut?: boolean;
+  pauseOnConstruction?: boolean;
+  pauseOnDebt?: boolean;
+  pauseOnStarvation?: boolean;
+  compactDensity?: boolean;
+  sidebarCollapsed?: boolean;
+  numberFormat?: 'compact' | 'scientific';
 }
