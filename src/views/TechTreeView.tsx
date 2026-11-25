@@ -113,6 +113,7 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
 }) => {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const minimapRef = useRef<SVGSVGElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [viewportSize, setViewportSize] = useState({ width: 1120, height: 760 });
   const [zoom, setZoom] = useState(0.72);
   const [pan, setPan] = useState({ x: 24, y: 16 });
@@ -199,6 +200,51 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
   const selectedLaneMeta = TECH_LANE_MAP[selectedNode.lane];
   const selectedEra = getEraForTier(selectedNode.tier);
   const leadsToNodes = DEPENDENTS_MAP.get(selectedNode.id) ?? [];
+
+  // Full transitive upstream prerequisite chain + nearest researchable blocker for locked nodes
+  const { ancestorNodeIds, ancestorEdgeKeys, nextResearchablePrereq } = useMemo(() => {
+    const visited = new Set<string>();
+    const edgeKeys = new Set<string>();
+    const stack: TechNode[] = [selectedNode];
+    let firstAvail: TechNode | null = null;
+
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      for (const preId of cur.prerequisites) {
+        edgeKeys.add(`${preId}_${cur.id}`);
+        if (visited.has(preId)) continue;
+        visited.add(preId);
+        const preNode = STATIC_NODE_MAP.get(preId);
+        if (preNode) {
+          if (!firstAvail && nodeStatusMap.get(preNode.id) === 'available') {
+            firstAvail = preNode;
+          }
+          stack.push(preNode);
+        }
+      }
+    }
+    return {
+      ancestorNodeIds: visited,
+      ancestorEdgeKeys: edgeKeys,
+      nextResearchablePrereq: firstAvail,
+    };
+  }, [selectedNode, nodeStatusMap]);
+
+  // '/' keyboard shortcut focuses the Tech Tree search input instantly
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) {
+        return;
+      }
+      e.preventDefault();
+      searchInputRef.current?.focus();
+      setSearchOpen(true);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   const focusOnNode = useCallback(
     (node: TechNode, targetZoom?: number) => {
@@ -427,6 +473,7 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
             <div className="relative">
               <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
+                ref={searchInputRef}
                 type="text"
                 value={searchQuery}
                 onFocus={() => setSearchOpen(true)}
@@ -440,10 +487,11 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
                     setSearchOpen(false);
                   } else if (e.key === 'Escape') {
                     setSearchOpen(false);
+                    searchInputRef.current?.blur();
                   }
                 }}
-                placeholder={`Search ${TECH_TREE.length} technologies...`}
-                className="h-8 pl-8 pr-7 w-60 rounded-md bg-[#111622] border border-[#1F2A3D] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7] placeholder:text-[#64748B]"
+                placeholder={`Search ${TECH_TREE.length} techs (press /)...`}
+                className="h-8 pl-8 pr-7 w-60 rounded-md bg-[#101521] border border-[#1E293B] focus:border-[#06B6D4] focus:outline-none text-xs text-[#E8EEF7] placeholder:text-[#64748B]"
               />
               {searchQuery && (
                 <button
@@ -742,8 +790,9 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
                 const midX = (edge.x1 + edge.x2) / 2;
                 const bothUnlocked =
                   unlockedSet.has(edge.from.id) && unlockedSet.has(edge.to.id);
-                const isSelectedEdge =
+                const isDirectSelected =
                   selectedNode.id === edge.to.id || selectedNode.id === edge.from.id;
+                const isAncestorChain = ancestorEdgeKeys.has(edge.key);
                 const edgeMatches =
                   nodeMatchesFilter(edge.from) || nodeMatchesFilter(edge.to);
 
@@ -753,14 +802,20 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
                     d={`M ${edge.x1} ${edge.y1} C ${midX} ${edge.y1}, ${midX} ${edge.y2}, ${edge.x2} ${edge.y2}`}
                     fill="none"
                     stroke={
-                      isSelectedEdge
-                        ? '#D97706'
-                        : bothUnlocked
-                          ? '#06B6D4'
-                          : '#26334A'
+                      isDirectSelected
+                        ? '#F59E0B'
+                        : isAncestorChain
+                          ? '#D97706'
+                          : bothUnlocked
+                            ? '#06B6D4'
+                            : '#26334A'
                     }
-                    strokeWidth={isSelectedEdge ? 2.5 : bothUnlocked ? 1.8 : 1.35}
-                    opacity={isSelectedEdge ? 1 : edgeMatches ? 0.85 : 0.14}
+                    strokeWidth={
+                      isDirectSelected ? 2.5 : isAncestorChain ? 2.0 : bothUnlocked ? 1.8 : 1.35
+                    }
+                    opacity={
+                      isDirectSelected || isAncestorChain ? 1 : edgeMatches ? 0.85 : 0.14
+                    }
                   />
                 );
               })}
@@ -770,13 +825,14 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
             {visibleNodes.map((node) => {
               const status = nodeStatusMap.get(node.id) ?? 'locked';
               const isSelected = selectedNode.id === node.id;
+              const isAncestor = ancestorNodeIds.has(node.id);
               const matches = nodeMatchesFilter(node);
               const proj = activeMap.get(node.id);
               const pct = proj ? Math.min(100, (proj.progressRp / proj.totalRp) * 100) : 0;
               const laneAccent = TECH_LANE_MAP[node.lane].accent;
 
-              let borderClass = 'border-[#1F2A3D]';
-              let bgClass = 'bg-[#0B0F17]';
+              let borderClass = 'border-[#1E293B]';
+              let bgClass = 'bg-[#0A0E16]';
               let statusLabel = 'Locked';
               let statusColor = 'text-[#64748B]';
 
@@ -792,7 +848,7 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
                 statusColor = 'text-[#22D3EE]';
               } else if (status === 'available') {
                 borderClass = 'border-[#2C3B55] hover:border-[#06B6D4]';
-                bgClass = 'bg-[#111622]';
+                bgClass = 'bg-[#101521]';
                 statusLabel = 'Available';
                 statusColor = 'text-[#FBBF24]';
               }
@@ -802,15 +858,29 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
                   key={node.id}
                   type="button"
                   onClick={() => setSelectedId(node.id)}
+                  onDoubleClick={() => {
+                    if (status === 'available' && canResearchTech(state, node.id).ok) {
+                      onStartResearch(node.id);
+                    }
+                  }}
+                  title={
+                    status === 'available'
+                      ? `${node.name} — Double-click to start research immediately`
+                      : node.name
+                  }
                   style={{
                     left: node.x,
                     top: node.y,
                     width: TECH_NODE_W,
                     height: TECH_NODE_H,
-                    opacity: matches || isSelected ? 1 : 0.2,
+                    opacity: matches || isSelected || isAncestor ? 1 : 0.2,
                   }}
                   className={`absolute rounded-md border px-2.5 py-1.5 text-left flex flex-col justify-between transition-colors cursor-pointer ${bgClass} ${borderClass} ${
-                    isSelected ? 'ring-2 ring-[#06B6D4] ring-offset-1 ring-offset-[#07090E]' : ''
+                    isSelected
+                      ? 'ring-2 ring-[#06B6D4] ring-offset-1 ring-offset-[#06080D]'
+                      : isAncestor
+                        ? 'ring-1 ring-[#D97706]/80'
+                        : ''
                   }`}
                 >
                   <div className="flex items-center justify-between gap-1 text-[10px] font-mono tabular-nums">
@@ -1017,6 +1087,16 @@ export const TechTreeView: React.FC<TechTreeViewProps> = ({
                 </button>
                 {!selectedCheck.ok && selectedCheck.reason && (
                   <p className="text-[11px] text-[#8C9BB2] text-center">{selectedCheck.reason}</p>
+                )}
+                {selectedStatus === 'locked' && nextResearchablePrereq && (
+                  <button
+                    type="button"
+                    onClick={() => focusOnNode(nextResearchablePrereq, Math.max(zoom, 0.8))}
+                    className="w-full h-8 rounded bg-[#101521] hover:bg-[#161D2D] border border-[#D97706]/50 text-xs font-medium text-[#FBBF24] flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Crosshair className="w-3.5 h-3.5" />
+                    <span className="truncate">Next Prereq: {nextResearchablePrereq.name}</span>
+                  </button>
                 )}
               </div>
             )}

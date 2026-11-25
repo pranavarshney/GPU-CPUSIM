@@ -917,10 +917,21 @@ export function advanceSimulationDays(
           let deployedNote = 'ready to assign in Manufacturing.';
           if (job.autoAssignLineId) {
             const targetLine = productionLines.find((l) => l.id === job.autoAssignLineId);
+            const completedChip = chips.find((c) => c.id === job.chipId);
             if (targetLine) {
               productionLines = productionLines.map((l) =>
                 l.id === job.autoAssignLineId ? { ...l, chipId: job.chipId } : l
               );
+              if (completedChip) {
+                state = {
+                  ...state,
+                  facilities: state.facilities.map((f) =>
+                    f.id === targetLine.fabId
+                      ? { ...f, assignedNodeId: completedChip.processNodeId }
+                      : f
+                  ),
+                };
+              }
               deployedNote = 'automatically deployed to the designated Fab line.';
             }
           }
@@ -1465,6 +1476,109 @@ export function archiveChipBlueprint(
     l.chipId === chipId ? { ...l, chipId: null } : l
   );
   return recomputeTelemetry({ ...state, chips, productionLines }, cache);
+}
+
+export function restoreChipBlueprint(
+  state: GameState,
+  chipId: string,
+  cache: ChipMetricsCache
+): GameState {
+  const chips = state.chips.map((c) =>
+    c.id === chipId && c.status === 'archived' ? { ...c, status: 'production' as const } : c
+  );
+  return recomputeTelemetry({ ...state, chips }, cache);
+}
+
+export function getEffectiveFabCapacity(state: GameState, fab: Facility): number {
+  const techMods = getAggregatedTechModifiers(state.unlockedTechIds);
+  const fabStaffBonus = Math.min(1.5, 0.72 + Math.log10(1 + state.staff.fabrication) * 0.42);
+  return Math.max(10, Math.round((fab.waferCapacityPerMonth ?? 100) * fabStaffBonus * techMods.fabThroughputMult));
+}
+
+export function getStaffImpactSummary(state: GameState): {
+  researchRpPerDay: number;
+  architectureRpPerDay: number;
+  tapeOutSpeedMult: number;
+  fabThroughputMult: number;
+  qaLevelBonus: number;
+} {
+  const techMods = getAggregatedTechModifiers(state.unlockedTechIds);
+  const techRpMult = techMods.rpGenerationMult;
+  return {
+    researchRpPerDay: state.staff.research * 0.52 * techRpMult,
+    architectureRpPerDay: state.staff.architecture * 0.22 * techRpMult,
+    tapeOutSpeedMult: 1 + Math.log10(1 + state.staff.architecture) * 0.45,
+    fabThroughputMult: Math.min(1.5, 0.72 + Math.log10(1 + state.staff.fabrication) * 0.42),
+    qaLevelBonus: getQaStaffLevelBonus(state.staff.qa),
+  };
+}
+
+export function getActiveResearchRates(state: GameState): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (state.activeResearch.length === 0) return out;
+  const totalRpDay = state.telemetry.rpPerDay;
+  const budgetSum =
+    state.researchBudgets.fabrication +
+    state.researchBudgets.cpu +
+    state.researchBudgets.gpu +
+    (state.researchBudgets.memory ?? 0) +
+    state.researchBudgets.support;
+
+  const weights = state.activeResearch.map((proj) => {
+    const tech = getTechNode(proj.techId);
+    const cat: TechCategory = tech?.category ?? 'fabrication';
+    const catShare =
+      cat === 'frontier'
+        ? 25
+        : state.researchBudgets[cat as keyof DepartmentBudgets] ?? 20;
+    return Math.max(5, (catShare / Math.max(1, budgetSum)) * 100);
+  });
+  const weightSum = weights.reduce((a, b) => a + b, 0);
+  for (let i = 0; i < state.activeResearch.length; i++) {
+    out[state.activeResearch[i].techId] =
+      totalRpDay * (weights[i] / Math.max(1, weightSum));
+  }
+  return out;
+}
+
+export function batchScaleProductionLines(
+  state: GameState,
+  mode: 'max' | 'balance',
+  cache: ChipMetricsCache
+): GameState {
+  const fabMap = new Map(state.facilities.filter((f) => f.kind === 'fab').map((f) => [f.id, f]));
+
+  if (mode === 'max') {
+    const productionLines = state.productionLines.map((line) => {
+      const fab = fabMap.get(line.fabId);
+      if (!fab || !line.chipId) return line;
+      const cap = getEffectiveFabCapacity(state, fab);
+      return { ...line, targetWaferStartsPerMonth: cap };
+    });
+    return recomputeTelemetry({ ...state, productionLines }, cache);
+  }
+
+  // 'balance': set target wafer starts to 100% first, inspect live run scale, then dial targets so zero bottleneck triggers
+  const maxedLines = state.productionLines.map((line) => {
+    const fab = fabMap.get(line.fabId);
+    if (!fab || !line.chipId) return line;
+    return { ...line, targetWaferStartsPerMonth: getEffectiveFabCapacity(state, fab) };
+  });
+  const probed = recomputeTelemetry({ ...state, productionLines: maxedLines }, cache);
+
+  const balancedLines = probed.productionLines.map((line) => {
+    if (!line.chipId) return line;
+    const fab = fabMap.get(line.fabId);
+    const cap = fab ? getEffectiveFabCapacity(state, fab) : line.targetWaferStartsPerMonth;
+    // Match actual sustainable wafer starts rounded cleanly down to nearest 5 wafers (minimum 5 if positive)
+    const sustainable = Math.min(cap, Math.floor(line.actualWaferStartsPerMonth / 5) * 5);
+    return {
+      ...line,
+      targetWaferStartsPerMonth: Math.max(line.actualWaferStartsPerMonth > 0 ? 5 : 0, sustainable),
+    };
+  });
+
+  return recomputeTelemetry({ ...state, productionLines: balancedLines }, cache);
 }
 
 export function getUnlockedTechCountInfo(state: GameState): { unlocked: number; total: number } {

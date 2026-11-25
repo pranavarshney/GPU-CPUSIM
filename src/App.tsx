@@ -14,6 +14,7 @@ import {
   advanceSimulationDays,
   archiveChipBlueprint,
   assignProductionLine,
+  batchScaleProductionLines,
   cancelResearchProject,
   createInitialState,
   migrateGameState,
@@ -21,6 +22,7 @@ import {
   queueFacilityUpgrade,
   recomputeTelemetry,
   renameCompany,
+  restoreChipBlueprint,
   setDepartmentBudgets,
   setQaBudget,
   startChipTapeOut,
@@ -519,6 +521,14 @@ export default function App() {
     setState((prev) => archiveChipBlueprint(prev, chipId, cacheRef.current));
   }, []);
 
+  const handleRestoreChip = useCallback((chipId: string) => {
+    setState((prev) => restoreChipBlueprint(prev, chipId, cacheRef.current));
+  }, []);
+
+  const handleBatchScaleLines = useCallback((mode: 'max' | 'balance') => {
+    setState((prev) => batchScaleProductionLines(prev, mode, cacheRef.current));
+  }, []);
+
   const handleRenameCompany = useCallback((nextName: string) => {
     setState((prev) => renameCompany(prev, nextName));
   }, []);
@@ -624,7 +634,11 @@ export default function App() {
 
         <main className="flex-1 overflow-y-auto bg-[#06080D] relative">
           {activeSection === 'overview' && (
-            <OverviewView state={state} onNavigate={setActiveSection} />
+            <OverviewView
+              state={state}
+              onNavigate={setActiveSection}
+              onJumpToTech={handleJumpToTech}
+            />
           )}
 
           {activeSection === 'research' && (
@@ -635,6 +649,7 @@ export default function App() {
               onUpdateBudgets={handleUpdateResearchBudgets}
               onAdvanceFrontier={handleAdvanceFrontier}
               onNavigate={setActiveSection}
+              onJumpToTech={handleJumpToTech}
             />
           )}
 
@@ -708,8 +723,11 @@ export default function App() {
             <ManufacturingView
               state={state}
               onUpdateLine={handleUpdateLine}
+              onBatchScaleLines={handleBatchScaleLines}
               onSetQaBudget={handleSetQaBudget}
               onNavigate={setActiveSection}
+              onInspectChip={handleInspectChip}
+              onCloneChip={handleLoadChipIntoArchitect}
             />
           )}
 
@@ -718,6 +736,7 @@ export default function App() {
               state={state}
               initialSelectedId={testingSelectedId}
               onArchiveChip={handleArchiveChip}
+              onRestoreChip={handleRestoreChip}
               onLoadIntoArchitect={handleLoadChipIntoArchitect}
             />
           )}

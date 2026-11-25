@@ -46,16 +46,35 @@ import {
   type SliderRange,
 } from './physics';
 import {
+  applyCpuPreset,
+  applyGpuPreset,
+  applyMemoryPreset,
+  bumpRevisionName,
+  getNextUnlockHints,
+  optimizeCpuDraft,
+  optimizeGpuDraft,
+  optimizeMemoryDraft,
+  type ArchitectPresetId,
+  type OptimizeActionId,
+} from './architectHelpers';
+import {
   advanceSimulationDays,
+  archiveChipBlueprint,
+  batchScaleProductionLines,
   buildPreviewPhysicsContext,
   createInitialState,
   createStarterCpuDraft,
   createStarterGpuDraft,
   createStarterMemoryDraft,
+  getActiveResearchRates,
+  getEffectiveFabCapacity,
+  getStaffImpactSummary,
   migrateGameState,
   queueFacilityBuild,
   queueFacilityUpgrade,
   recomputeTelemetry,
+  renameCompany,
+  restoreChipBlueprint,
   startChipTapeOut,
 } from './simulation';
 import type { GameState, MemoryBlueprint } from './types';
@@ -1079,6 +1098,103 @@ test('18. Cumulative TechModifiers improve CPU/GPU/Memory physics & simulation c
   assert.ok(fullState.telemetry.rpPerDay > baseState.telemetry.rpPerDay * 2, 'Lab RP/day should scale strongly with R&D');
   assert.ok(fullState.telemetry.monthlySiliconProd > baseState.telemetry.monthlySiliconProd * 1.5, 'Silicon refining should scale with R&D');
   assert.ok(Number.isFinite(fullState.telemetry.monthlyCreditIncome) && fullState.telemetry.monthlyCreditIncome > 0);
+});
+
+// ─── TEST 19: Architect Role Presets, Auto-Optimizers, Smart Naming & Unlock Hints ──
+test('19. Architect presets & auto-optimizers stay voltage-stable and deterministic across CPU/GPU/Memory', () => {
+  const state = createInitialState();
+  const presets: ArchitectPresetId[] = ['low_power', 'balanced', 'high_yield', 'flagship'];
+  const actions: OptimizeActionId[] = [
+    'fit_reticle',
+    'stabilize_voltage',
+    'match_cooling',
+    'balance_bandwidth',
+  ];
+
+  for (const preset of presets) {
+    const cpu = applyCpuPreset(state.cpuDraft, preset, state);
+    const cpuEval = evaluateCpuPhysics(cpu, buildPreviewPhysicsContext(state, cpu.processNodeId, 1.0));
+    assert.equal(cpuEval.physics.voltageUnstable, false, `CPU preset ${preset} must be voltage-stable`);
+    assert.ok(Number.isFinite(cpuEval.benchmarks.overallRating));
+
+    const gpu = applyGpuPreset(state.gpuDraft, preset, state);
+    const gpuEval = evaluateGpuPhysics(gpu, buildPreviewPhysicsContext(state, gpu.processNodeId, 1.0));
+    assert.equal(gpuEval.physics.voltageUnstable, false, `GPU preset ${preset} must be voltage-stable`);
+    assert.ok(Number.isFinite(gpuEval.benchmarks.overallRating));
+
+    const mem = applyMemoryPreset(state.memoryDraft, preset, state);
+    const memEval = evaluateMemoryPhysics(mem, buildPreviewPhysicsContext(state, mem.processNodeId, 1.0));
+    assert.equal(memEval.physics.voltageUnstable, false, `Memory preset ${preset} must be voltage-stable`);
+    assert.ok(Number.isFinite(memEval.benchmarks.overallRating));
+  }
+
+  for (const action of actions) {
+    const optCpu = optimizeCpuDraft(state.cpuDraft, action, state);
+    const optGpu = optimizeGpuDraft(state.gpuDraft, action, state);
+    const optMem = optimizeMemoryDraft(state.memoryDraft, action, state);
+    assert.ok(Number.isFinite(optCpu.voltageV) && optCpu.voltageV > 0);
+    assert.ok(Number.isFinite(optGpu.voltageV) && optGpu.voltageV > 0);
+    assert.ok(Number.isFinite(optMem.voltageV) && optMem.voltageV > 0);
+  }
+
+  assert.equal(bumpRevisionName('Foundry-1 Scalar'), 'Foundry-1 Scalar Rev 2');
+  assert.equal(bumpRevisionName('Foundry-1 Scalar Rev 2'), 'Foundry-1 Scalar Rev 3');
+  assert.equal(bumpRevisionName('Foundry-1 Scalar Rev 9'), 'Foundry-1 Scalar Rev 10');
+
+  const hints = getNextUnlockHints('cpu', state.unlockedTechIds);
+  assert.ok(hints.length > 0 && hints.length <= 4);
+  for (const h of hints) {
+    assert.ok(TECH_TREE.some((t) => t.id === h.techId), `Hint techId ${h.techId} must exist in TECH_TREE`);
+  }
+  const memHints = getNextUnlockHints('memory', state.unlockedTechIds, state.memoryDraft.memoryCategory);
+  assert.ok(memHints.length > 0 && memHints.length <= 4);
+  for (const h of memHints) {
+    assert.ok(TECH_TREE.some((t) => t.id === h.techId), `Memory hint techId ${h.techId} must exist in TECH_TREE`);
+  }
+});
+
+// ─── TEST 20: Phase 3 & 4 Simulation Helpers (Batch Fab Scale, Unarchive, Auto-Assign, Rename) ──
+test('20. Batch fab scaling, chip archive/restore, company rename, and tape-out auto-assign work cleanly', () => {
+  const cache = new ChipMetricsCache();
+  let st = createInitialState();
+
+  // Rename company
+  st = renameCompany(st, 'Apex Photolithography Works');
+  assert.equal(st.companyName, 'Apex Photolithography Works');
+
+  // Effective fab capacity reflects fab staff + tech throughput multipliers
+  const fab = st.facilities.find((f) => f.kind === 'fab')!;
+  const effCap = getEffectiveFabCapacity(st, fab);
+  assert.ok(effCap >= 10 && Number.isFinite(effCap));
+
+  // Batch max & balance
+  const maxed = batchScaleProductionLines(st, 'max', cache);
+  assert.equal(maxed.productionLines[0].targetWaferStartsPerMonth, effCap);
+  const balanced = batchScaleProductionLines(maxed, 'balance', cache);
+  assert.ok(balanced.productionLines[0].targetWaferStartsPerMonth <= effCap);
+
+  // Archive & Restore chip
+  const chipId = st.chips[0].id;
+  const archived = archiveChipBlueprint(st, chipId, cache);
+  assert.equal(archived.chips.find((c) => c.id === chipId)?.status, 'archived');
+  const restored = restoreChipBlueprint(archived, chipId, cache);
+  assert.equal(restored.chips.find((c) => c.id === chipId)?.status, 'production');
+
+  // Staff impact summary & research rates
+  const impact = getStaffImpactSummary(st);
+  assert.ok(impact.tapeOutSpeedMult >= 1 && impact.fabThroughputMult >= 0.72);
+  const rates = getActiveResearchRates(st);
+  assert.deepEqual(rates, {});
+
+  // Tape-out auto-assign deploys chip onto target line and updates parent fab node
+  const richState = { ...st, credits: 500_000 };
+  const targetLineId = richState.productionLines[0].id;
+  const toRes = startChipTapeOut(richState, richState.cpuDraft, cache, targetLineId);
+  assert.equal(toRes.error, undefined);
+  assert.equal(toRes.state.tapeOutQueue[0].autoAssignLineId, targetLineId);
+  const newChipId = toRes.state.tapeOutQueue[0].chipId;
+  const after = advanceSimulationDays(toRes.state, 200, cache);
+  assert.equal(after.state.productionLines[0].chipId, newChipId);
 });
 
 console.log(`\nAll ${passed} audit verification tests passed.`);
